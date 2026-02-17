@@ -173,6 +173,34 @@ struct WebViewPlayground: View {
 }
 ```
 
+## Window Creation & Popups
+
+`SkipWeb` exposes popup/window creation through `SkipWebUIDelegate` on `WebEngineConfiguration`.
+This delegate API lets host apps decide whether a popup should open and which child `WebEngine` should back it.
+
+For full API details and usage examples, see [`SkipWebUIDelegate.md`](./SkipWebUIDelegate.md).
+
+The `createWebViewWith` callback returns a `WebEngine?`:
+
+- Return `nil` to deny child-window creation.
+- Return a child `WebEngine` to allow child-window creation.
+
+JavaScript popup behavior can be configured with:
+
+- `WebEngineConfiguration.javaScriptCanOpenWindowsAutomatically` (maps to both iOS and Android platform settings).
+
+### Platform callback semantics
+
+Callbacks are platform-agnostic, but invocation source differs:
+
+| Callback | iOS (WebKit) | Android |
+| --- | --- | --- |
+| `webView(_:createWebViewWith:platformContext:)` | Called from `WKUIDelegate.createWebViewWith` | Called from `WebChromeClient.onCreateWindow` |
+| `webViewDidClose(_:child:)` | Called from `WKUIDelegate.webViewDidClose` | Called from `WebChromeClient.onCloseWindow` |
+
+`WebWindowRequest.targetURL` may be `nil` on Android during `onCreateWindow`.
+`PlatformCreateWindowContext` aliases `WebKitCreateWindowParams` on iOS and `AndroidCreateWindowParams` on Android.
+
 ## Contribution
 
 Many delegates that are provided by `WKWebView` are not yet implemented in this project,
