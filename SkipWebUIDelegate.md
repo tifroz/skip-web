@@ -79,10 +79,8 @@ public final class PopupDelegateProbe: NSObject, SkipWebUIDelegate {
         }
         #else
         return MainActor.assumeIsolated {
-            // Create a platform-native view here
-            // PlatformWebView is an alias for WKWebView (iOS), or WebView (android)
-            let childWebView = PlatformWebView(frame: .zero, configuration: platformContext.configuration)
-            return WebEngine(configuration: WebEngineConfiguration(), webView: childWebView)
+            let child = platformContext.makeChildWebEngine()
+            return child
         }
         #endif
     }
@@ -126,5 +124,9 @@ struct PopupHostView: View {
 
 - Keep delegate method signatures exactly aligned with the protocol.
 - Keep the delegate class shape simple and direct.
-- For iOS popup creation, prefer constructing the child with `platformContext.configuration`.
+- On iOS, WebKit requires the returned child to be initialized with the exact configuration supplied to `WKUIDelegate.createWebViewWith`.
+- If this contract is violated, WebKit can raise `NSInternalInconsistencyException` with: `Returned WKWebView was not created with the given configuration.`
+- For iOS popup creation, return a child created via `platformContext.makeChildWebEngine(...)`.
+- `makeChildWebEngine()` mirrors the parent `WebEngineConfiguration` and inspectability by default. Pass an explicit configuration only when you intentionally want different child behavior.
+- `makeChildWebEngine()` does not automatically copy platform delegate assignments (`WKUIDelegate`, `WKNavigationDelegate`) from the parent web view; assign those explicitly when needed.
 - `PlatformCreateWindowContext` aliases `WebKitCreateWindowParams` on iOS and `AndroidCreateWindowParams` on Android.

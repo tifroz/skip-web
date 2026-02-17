@@ -769,7 +769,9 @@ extension WebViewCoordinator: WebUIDelegate {
         let params = WebKitCreateWindowParams(
             configuration: configuration,
             navigationAction: navigationAction,
-            windowFeatures: windowFeatures
+            windowFeatures: windowFeatures,
+            parentConfigurationSnapshot: config.popupChildMirroredConfiguration(),
+            parentIsInspectable: webView.isInspectable
         )
         guard let childEngine = config.uiDelegate?.webView(
             self.webView,
@@ -779,8 +781,22 @@ extension WebViewCoordinator: WebUIDelegate {
             return nil
         }
 
-        if childEngine.webView.configuration !== configuration {
-            logger.error("SkipWeb createWebViewWith: returned child WebEngine.webView uses a different WKWebViewConfiguration instance than WebKit provided; popup creation will continue, but prefer constructing the child with platformContext.configuration for full parity.")
+        // WebKit requires the returned child WKWebView to be initialized with the
+        // exact `configuration` received in this callback. If that contract is
+        // violated, WebKit can raise NSInternalInconsistencyException:
+        // "Returned WKWebView was not created with the given configuration."
+        switch PopupConfigRegistry.verifyAndConsume(
+            childWebViewID: ObjectIdentifier(childEngine.webView),
+            expectedConfigID: ObjectIdentifier(configuration)
+        ) {
+        case .matched:
+            break
+        case .mismatch:
+            logger.error("SkipWeb popup contract violation: child WKWebView was not initialized with the WKWebViewConfiguration provided by WKUIDelegate createWebViewWith. This can trigger NSInternalInconsistencyException: 'Returned WKWebView was not created with the given configuration.' Popup creation will continue.")
+        case .missingRegistration:
+            if PopupConfigRegistry.shouldLogMissingRegistrationWarning() {
+                logger.warning("SkipWeb popup contract could not be verified because no popup construction record was found. Return a child created by platformContext.makeChildWebEngine(...) from your createWebViewWith delegate. Violating this WebKit contract can trigger NSInternalInconsistencyException: 'Returned WKWebView was not created with the given configuration.'")
+            }
         }
 
         childEnginesByWebViewID[ObjectIdentifier(childEngine.webView)] = childEngine

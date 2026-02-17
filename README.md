@@ -201,6 +201,21 @@ Callbacks are platform-agnostic, but invocation source differs:
 `WebWindowRequest.targetURL` may be `nil` on Android during `onCreateWindow`.
 `PlatformCreateWindowContext` aliases `WebKitCreateWindowParams` on iOS and `AndroidCreateWindowParams` on Android.
 
+### iOS WebKit popup contract
+
+When handling iOS popups through `WKUIDelegate.createWebViewWith`, WebKit requires that the returned child `WKWebView` be initialized with the exact `WKWebViewConfiguration` provided by WebKit for that callback.
+
+If this contract is violated, WebKit can raise `NSInternalInconsistencyException` with:
+`Returned WKWebView was not created with the given configuration.`
+
+SkipWeb validates this contract at popup creation time:
+- A warning is logged when verification cannot be performed.
+- An error is logged when a contract violation is detected.
+
+For iOS parity, return a child created with `platformContext.makeChildWebEngine(...)`.
+By default this mirrors the parent `WebEngineConfiguration` and inspectability on the popup child. Pass an explicit configuration only when you intentionally want the child to diverge.
+This default mirroring is configuration-level. Platform delegate assignments on the returned child (`WKUIDelegate`, `WKNavigationDelegate`) are not automatically copied from the parent, so assign them explicitly if your app depends on that behavior.
+
 ## Contribution
 
 Many delegates that are provided by `WKWebView` are not yet implemented in this project,

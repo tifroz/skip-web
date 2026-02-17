@@ -537,11 +537,112 @@ public struct WebKitCreateWindowParams {
     public let configuration: WKWebViewConfiguration
     public let navigationAction: WKNavigationAction
     public let windowFeatures: WKWindowFeatures
+    let parentConfigurationSnapshot: WebEngineConfiguration
+    let parentIsInspectable: Bool
 
-    public init(configuration: WKWebViewConfiguration, navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) {
+    public init(
+        configuration: WKWebViewConfiguration,
+        navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures,
+        parentConfigurationSnapshot: WebEngineConfiguration = WebEngineConfiguration(),
+        parentIsInspectable: Bool = true
+    ) {
         self.configuration = configuration
         self.navigationAction = navigationAction
         self.windowFeatures = windowFeatures
+        self.parentConfigurationSnapshot = parentConfigurationSnapshot
+        self.parentIsInspectable = parentIsInspectable
+    }
+}
+
+public extension WebKitCreateWindowParams {
+    /// Creates a popup child engine using the exact WKWebViewConfiguration
+    /// supplied by WebKit for this createWebViewWith callback.
+    ///
+    /// Using this helper preserves WebKit's popup contract and avoids
+    /// NSInternalInconsistencyException ("Returned WKWebView was not created with
+    /// the given configuration.") caused by configuration mismatches.
+    @MainActor public func makeChildWebEngine(
+        configuration webEngineConfiguration: WebEngineConfiguration? = nil,
+        frame: CGRect = .zero,
+        isInspectable: Bool? = nil
+    ) -> WebEngine {
+        let effectiveConfiguration = (webEngineConfiguration ?? parentConfigurationSnapshot).popupChildMirroredConfiguration()
+        let childWebView = WKWebView(frame: frame, configuration: configuration)
+        registerPopupChild(childWebView)
+
+        let preferences = childWebView.configuration.defaultWebpagePreferences!
+        preferences.allowsContentJavaScript = effectiveConfiguration.javaScriptEnabled
+        childWebView.configuration.preferences.javaScriptCanOpenWindowsAutomatically = effectiveConfiguration.javaScriptCanOpenWindowsAutomatically
+        childWebView.allowsBackForwardNavigationGestures = effectiveConfiguration.allowsBackForwardNavigationGestures
+        childWebView.scrollView.isScrollEnabled = effectiveConfiguration.isScrollEnabled
+        childWebView.pageZoom = effectiveConfiguration.pageZoom
+        childWebView.isOpaque = effectiveConfiguration.isOpaque
+        childWebView.isInspectable = isInspectable ?? parentIsInspectable
+        if effectiveConfiguration.customUserAgent != "" {
+            childWebView.customUserAgent = effectiveConfiguration.customUserAgent
+        }
+
+        let childEngine = WebEngine(configuration: effectiveConfiguration, webView: childWebView)
+        childEngine.refreshMessageHandlers()
+        childEngine.updateUserScripts()
+        return childEngine
+    }
+
+    @MainActor func registerPopupChild(_ childWebView: WKWebView) {
+        registerPopupChild(childWebView, initializedWith: configuration)
+    }
+
+    @MainActor func registerPopupChild(_ childWebView: WKWebView, initializedWith initConfiguration: WKWebViewConfiguration) {
+        PopupConfigRegistry.register(
+            childWebViewID: ObjectIdentifier(childWebView),
+            initConfigID: ObjectIdentifier(initConfiguration)
+        )
+    }
+}
+
+/// Tracks popup child construction-time configuration for WKUIDelegate validation.
+///
+/// Why this exists:
+/// - WebKit requires that the WKWebView returned from
+///   `WKUIDelegate.webView(_:createWebViewWith:for:windowFeatures:)`
+///   be initialized with the exact configuration passed into that callback.
+/// - Violating this contract can raise
+///   `NSInternalInconsistencyException` with:
+///   "Returned WKWebView was not created with the given configuration."
+/// - `child.webView.configuration` cannot be used for identity validation after init,
+///   because WebKit may expose a distinct configuration instance there.
+///
+/// To verify the contract reliably, SkipWeb records the configuration identity used
+/// at child construction time (via `makeChildWebEngine`) and compares that recorded
+/// identity in createWebViewWith.
+@MainActor enum PopupConfigRegistry {
+    enum VerificationResult {
+        case matched
+        case mismatch
+        case missingRegistration
+    }
+
+    private static var childInitConfigByWebViewID: [ObjectIdentifier: ObjectIdentifier] = [:]
+    private static var didLogMissingRegistrationWarning = false
+
+    static func register(childWebViewID: ObjectIdentifier, initConfigID: ObjectIdentifier) {
+        childInitConfigByWebViewID[childWebViewID] = initConfigID
+    }
+
+    static func verifyAndConsume(childWebViewID: ObjectIdentifier, expectedConfigID: ObjectIdentifier) -> VerificationResult {
+        guard let initConfigID = childInitConfigByWebViewID.removeValue(forKey: childWebViewID) else {
+            return .missingRegistration
+        }
+        return initConfigID == expectedConfigID ? .matched : .mismatch
+    }
+
+    static func shouldLogMissingRegistrationWarning() -> Bool {
+        if didLogMissingRegistrationWarning {
+            return false
+        }
+        didLogMissingRegistrationWarning = true
+        return true
     }
 }
 #else
@@ -656,6 +757,29 @@ public extension SkipWebUIDelegate {
         self.messageHandlers = messageHandlers
         self.schemeHandlers = schemeHandlers
         self.uiDelegate = uiDelegate
+    }
+
+    public func popupChildMirroredConfiguration() -> WebEngineConfiguration {
+        let copy = WebEngineConfiguration(
+            javaScriptEnabled: javaScriptEnabled,
+            javaScriptCanOpenWindowsAutomatically: javaScriptCanOpenWindowsAutomatically,
+            allowsBackForwardNavigationGestures: allowsBackForwardNavigationGestures,
+            allowsPullToRefresh: allowsPullToRefresh,
+            allowsInlineMediaPlayback: allowsInlineMediaPlayback,
+            dataDetectorsEnabled: dataDetectorsEnabled,
+            isScrollEnabled: isScrollEnabled,
+            pageZoom: pageZoom,
+            isOpaque: isOpaque,
+            customUserAgent: customUserAgent,
+            userScripts: userScripts,
+            messageHandlers: messageHandlers,
+            schemeHandlers: schemeHandlers,
+            uiDelegate: uiDelegate
+        )
+        #if SKIP
+        copy.context = context
+        #endif
+        return copy
     }
 
     #if !SKIP
