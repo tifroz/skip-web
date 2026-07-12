@@ -206,6 +206,19 @@ public struct SkipWebSnapshotImageFormat: Equatable, Sendable {
     }
 }
 
+/// Selects the Android rendering source used to capture a web-view snapshot.
+public enum AndroidSnapshotCaptureMode: Hashable, Sendable {
+    /// Draws the WebView content directly into a bitmap-backed canvas.
+    ///
+    /// This excludes other window content, including overlays and blur effects, and compensates
+    /// for the WebView's current scroll offset so the visible portion of the page is captured.
+    case webViewContent
+    /// Copies the pixels currently composited in the WebView's window rectangle.
+    ///
+    /// This includes anything drawn over the WebView, including overlays and blur effects.
+    case visibleWindowPixels
+}
+
 /// Snapshot configuration for `WebEngine.takeSnapshot(configuration:)`.
 ///
 /// This mirrors the key behavior of `WKSnapshotConfiguration`:
@@ -213,6 +226,9 @@ public struct SkipWebSnapshotImageFormat: Equatable, Sendable {
 /// - `snapshotWidth`: optional output width while preserving aspect ratio
 /// - `afterScreenUpdates`: capture after pending updates when possible
 /// - `imageFormat`: encoded output format for the returned image bytes
+///
+/// On Android, `androidCaptureMode` selects whether the WebView content or its composited window
+/// pixels are captured. It has no effect on iOS.
 public struct SkipWebSnapshotConfiguration: Sendable {
     /// View-coordinate capture region (`.null` means full visible bounds).
     public var rect: SkipWebSnapshotRect
@@ -220,6 +236,8 @@ public struct SkipWebSnapshotConfiguration: Sendable {
     public var snapshotWidth: Double?
     /// Capture after pending updates when possible.
     public var afterScreenUpdates: Bool
+    /// Rendering source used for Android snapshots. This value has no effect on iOS.
+    public var androidCaptureMode: AndroidSnapshotCaptureMode
     /// Encoded output format for the returned image bytes.
     public var imageFormat: SkipWebSnapshotImageFormat
 
@@ -227,11 +245,13 @@ public struct SkipWebSnapshotConfiguration: Sendable {
         rect: SkipWebSnapshotRect = .null,
         snapshotWidth: Double? = nil,
         afterScreenUpdates: Bool = true,
+        androidCaptureMode: AndroidSnapshotCaptureMode = .webViewContent,
         imageFormat: SkipWebSnapshotImageFormat = .jpeg(quality: 0.85)
     ) {
         self.rect = rect
         self.snapshotWidth = snapshotWidth
         self.afterScreenUpdates = afterScreenUpdates
+        self.androidCaptureMode = androidCaptureMode
         self.imageFormat = imageFormat
     }
 }
@@ -261,6 +281,8 @@ public enum WebSnapshotError: Error {
     case invalidRect
     case emptySnapshot
     case imageEncodingFailed
+    /// PixelCopy could not capture the requested visible window pixels on Android.
+    case visibleWindowPixelsCaptureFailed
 }
 
 /// Portable cookie representation shared by iOS and Android implementations.
@@ -1918,15 +1940,7 @@ extension WebCookie {
         let targetHeight = max(1, Int((Double(captureHeight) * (Double(targetWidth) / Double(captureWidth))).rounded()))
 
         let bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        let didUsePixelCopy = await copyAndroidSnapshotWithPixelCopyIfAvailable(
-            into: bitmap,
-            minX: minX,
-            minY: minY,
-            maxX: maxX,
-            maxY: maxY,
-            afterScreenUpdates: config.afterScreenUpdates
-        )
-        if !didUsePixelCopy {
+        if config.androidCaptureMode == .webViewContent {
             drawAndroidSnapshot(
                 into: bitmap,
                 minX: minX,
@@ -1936,6 +1950,18 @@ extension WebCookie {
                 targetWidth: targetWidth,
                 targetHeight: targetHeight
             )
+        } else {
+            let didCopyVisibleWindowPixels = await copyAndroidVisibleWindowPixels(
+                into: bitmap,
+                minX: minX,
+                minY: minY,
+                maxX: maxX,
+                maxY: maxY
+            )
+            guard didCopyVisibleWindowPixels else {
+                bitmap.recycle()
+                throw WebSnapshotError.visibleWindowPixelsCaptureFailed
+            }
         }
 
         let outputStream = java.io.ByteArrayOutputStream()
@@ -1979,17 +2005,13 @@ extension WebCookie {
         webView.draw(canvas)
     }
 
-    private func copyAndroidSnapshotWithPixelCopyIfAvailable(
+    private func copyAndroidVisibleWindowPixels(
         into bitmap: Bitmap,
         minX: Int,
         minY: Int,
         maxX: Int,
-        maxY: Int,
-        afterScreenUpdates: Bool
+        maxY: Int
     ) async -> Bool {
-        guard afterScreenUpdates else {
-            return false
-        }
         guard android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O else {
             return false
         }

@@ -492,16 +492,24 @@ final class SkipWebTests: XCTestCase {
         XCTAssertTrue(config.rect.isNull)
         XCTAssertNil(config.snapshotWidth)
         XCTAssertTrue(config.afterScreenUpdates)
+        XCTAssertEqual(config.androidCaptureMode, .webViewContent)
         XCTAssertEqual(config.imageFormat.mimeType, "image/jpeg")
         XCTAssertEqual(config.imageFormat.quality, 0.85)
     }
 
     func testSnapshotConfigurationFieldRoundTrip() {
         let rect = SkipWebSnapshotRect(x: 10, y: 20, width: 120, height: 80)
-        let config = SkipWebSnapshotConfiguration(rect: rect, snapshotWidth: 64, afterScreenUpdates: false, imageFormat: .png)
+        let config = SkipWebSnapshotConfiguration(
+            rect: rect,
+            snapshotWidth: 64,
+            afterScreenUpdates: false,
+            androidCaptureMode: .visibleWindowPixels,
+            imageFormat: .png
+        )
         XCTAssertEqual(config.rect, rect)
         XCTAssertEqual(config.snapshotWidth, 64)
         XCTAssertFalse(config.afterScreenUpdates)
+        XCTAssertEqual(config.androidCaptureMode, .visibleWindowPixels)
         XCTAssertEqual(config.imageFormat, .png)
     }
 
