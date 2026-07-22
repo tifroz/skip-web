@@ -10,7 +10,12 @@ final class WebProfileSegregationTests: XCTestCase {
     func testWebProfileValidationRules() {
         XCTAssertNil(WebProfilePolicy.validationError(for: WebProfile.default))
         XCTAssertNil(WebProfilePolicy.validationError(for: WebProfile.ephemeral))
+        XCTAssertNil(WebProfilePolicy.validationError(for: WebProfile.ephemeralSession("session-a")))
         XCTAssertNil(WebProfilePolicy.validationError(for: WebProfile.named("profile-a")))
+        XCTAssertEqual(
+            WebProfilePolicy.validationError(for: WebProfile.ephemeralSession(" ")),
+            WebProfileError.invalidProfileName
+        )
         XCTAssertEqual(WebProfilePolicy.validationError(for: WebProfile.named(" ")), WebProfileError.invalidProfileName)
         XCTAssertEqual(WebProfilePolicy.validationError(for: WebProfile.named("default")), WebProfileError.invalidProfileName)
     }
@@ -23,6 +28,19 @@ final class WebProfileSegregationTests: XCTestCase {
             WebProfileError.unsupportedOnAndroid
         )
         XCTAssertNil(WebProfilePolicy.androidSupportError(for: WebProfile.ephemeral, isMultiProfileFeatureSupported: true))
+        XCTAssertEqual(
+            WebProfilePolicy.androidSupportError(
+                for: WebProfile.ephemeralSession("session-a"),
+                isMultiProfileFeatureSupported: false
+            ),
+            WebProfileError.unsupportedOnAndroid
+        )
+        XCTAssertNil(
+            WebProfilePolicy.androidSupportError(
+                for: WebProfile.ephemeralSession("session-a"),
+                isMultiProfileFeatureSupported: true
+            )
+        )
         XCTAssertEqual(
             WebProfilePolicy.androidSupportError(for: WebProfile.named("android-profile"), isMultiProfileFeatureSupported: false),
             WebProfileError.unsupportedOnAndroid
@@ -125,6 +143,32 @@ final class WebProfileSegregationTests: XCTestCase {
 
         await engineA.clearCookies()
         await engineB.clearCookies()
+    }
+
+    /// Ensures one session-scoped iOS ephemeral profile is shared, then starts empty after release.
+    @MainActor
+    func testIOSEphemeralSessionSharesThenReleasesWebsiteData() async throws {
+        let identifier = "ios_ephemeral_session_\(UUID().uuidString)"
+        let profile = WebProfile.ephemeralSession(identifier)
+        var engineA: WebEngine? = await makeCookieTestEngine(profile: profile)
+        var engineB: WebEngine? = await makeCookieTestEngine(profile: profile)
+        let requestURL = try XCTUnwrap(URL(string: "https://ios-ephemeral-session.example.com/path"))
+        let cookieName = "ios_ephemeral_session_cookie_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+
+        try await engineA?.setCookie(WebCookie(name: cookieName, value: "shared"), requestURL: requestURL)
+        let sharedHeader = await engineB?.cookieHeader(for: requestURL)
+        XCTAssertTrue(sharedHeader?.contains("\(cookieName)=shared") == true)
+
+        engineA = nil
+        engineB = nil
+        XCTAssertTrue(try await WebEngine.clearEphemeralSessionProfile(identifier: identifier))
+
+        var replacement: WebEngine? = await makeCookieTestEngine(profile: profile)
+        let replacementHeader = await replacement?.cookieHeader(for: requestURL)
+        XCTAssertFalse(replacementHeader?.contains(cookieName) == true)
+        await replacement?.clearCookies()
+        replacement = nil
+        _ = try await WebEngine.clearEphemeralSessionProfile(identifier: identifier)
     }
     #endif
 
@@ -261,6 +305,7 @@ final class WebProfileSegregationTests: XCTestCase {
         await engineA.clearCookies()
         await engineB.clearCookies()
     }
+
     #endif
 
     #endif

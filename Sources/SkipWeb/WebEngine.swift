@@ -12,11 +12,14 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import androidx.webkit.WebResourceRequestCompat
 import androidx.webkit.ScriptHandler
+import androidx.webkit.ProfileStore
+import androidx.webkit.WebStorageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -34,6 +37,12 @@ public enum WebProfile: Equatable, Hashable, Sendable {
     /// On iOS this maps to `WKWebsiteDataStore.nonPersistent()`. On Android this maps to
     /// a generated named WebView profile when `MULTI_PROFILE` is supported.
     case ephemeral
+    /// Uses one explicitly owned ephemeral browsing session shared by multiple web views.
+    ///
+    /// Call `WebEngine.clearEphemeralSessionProfile(identifier:)` when the session ends.
+    /// On iOS the shared nonpersistent data store is released. On Android all browsing data
+    /// in the corresponding isolated WebView profile is deleted.
+    case ephemeralSession(String)
 
     fileprivate var normalizedNamedIdentifier: String? {
         guard case .named(let rawIdentifier) = self else {
@@ -44,6 +53,17 @@ public enum WebProfile: Equatable, Hashable, Sendable {
             return nil
         }
         if identifier.lowercased() == "default" {
+            return nil
+        }
+        return identifier
+    }
+
+    fileprivate var normalizedEphemeralSessionIdentifier: String? {
+        guard case .ephemeralSession(let rawIdentifier) = self else {
+            return nil
+        }
+        let identifier = rawIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !identifier.isEmpty else {
             return nil
         }
         return identifier
@@ -61,6 +81,8 @@ enum WebProfilePolicy {
         switch profile {
         case .default, .ephemeral:
             return nil
+        case .ephemeralSession:
+            return profile.normalizedEphemeralSessionIdentifier == nil ? .invalidProfileName : nil
         case .named:
             return profile.normalizedNamedIdentifier == nil ? .invalidProfileName : nil
         }
@@ -76,13 +98,33 @@ enum WebProfilePolicy {
         switch profile {
         case .default:
             return nil
-        case .ephemeral:
+        case .ephemeral, .ephemeralSession:
             return isMultiProfileFeatureSupported ? nil : .unsupportedOnAndroid
         case .named:
             return isMultiProfileFeatureSupported ? nil : .unsupportedOnAndroid
         }
     }
 }
+
+#if !SKIP
+@MainActor
+private enum EphemeralSessionWebsiteDataStores {
+    private static var stores: [String: WKWebsiteDataStore] = [:]
+
+    static func store(for identifier: String) -> WKWebsiteDataStore {
+        if let existing = stores[identifier] {
+            return existing
+        }
+        let store = WKWebsiteDataStore.nonPersistent()
+        stores[identifier] = store
+        return store
+    }
+
+    static func release(identifier: String) -> Bool {
+        stores.removeValue(forKey: identifier) != nil
+    }
+}
+#endif
 
 #if SKIP || os(iOS)
 
@@ -551,8 +593,11 @@ public struct AndroidCosmeticRule: Equatable, Sendable {
     }
 }
 
+@MainActor
 public protocol SkipWebNavigationDelegate {
     func webEngine(_ engine: WebEngine, shouldOverrideURLLoading url: URL) -> Bool
+    /// Called when the main frame starts provisional navigation and exposes its concrete URL.
+    func webEngineDidStartProvisionalNavigation(_ engine: WebEngine)
     func webEngineDidCommitNavigation(_ engine: WebEngine)
     func webEngineDidFinishNavigation(_ engine: WebEngine)
     func webEngine(_ engine: WebEngine, didFailNavigation error: Error)
@@ -561,6 +606,9 @@ public protocol SkipWebNavigationDelegate {
 public extension SkipWebNavigationDelegate {
     func webEngine(_ engine: WebEngine, shouldOverrideURLLoading url: URL) -> Bool {
         false
+    }
+
+    func webEngineDidStartProvisionalNavigation(_ engine: WebEngine) {
     }
 
     func webEngineDidCommitNavigation(_ engine: WebEngine) {
@@ -572,6 +620,62 @@ public extension SkipWebNavigationDelegate {
     func webEngine(_ engine: WebEngine, didFailNavigation error: Error) {
     }
 }
+
+#if !SKIP
+/// Forwards navigation events while an engine is not mounted in a `WebView` coordinator.
+///
+/// Popup children need this immediately after creation so their first URL and redirects can be
+/// classified while the engine remains detached from the visible browser hierarchy.
+@MainActor
+private final class WebEngineConfigurationNavigationDelegate: NSObject, WKNavigationDelegate {
+    weak var engine: WebEngine?
+    let navigationDelegate: any SkipWebNavigationDelegate
+
+    init(engine: WebEngine, navigationDelegate: any SkipWebNavigationDelegate) {
+        self.engine = engine
+        self.navigationDelegate = navigationDelegate
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        preferences: WKWebpagePreferences
+    ) async -> (WKNavigationActionPolicy, WKWebpagePreferences) {
+        guard navigationAction.targetFrame?.isMainFrame != false,
+              let engine,
+              let url = navigationAction.request.url else {
+            return (.allow, preferences)
+        }
+        let shouldCancel = navigationDelegate.webEngine(engine, shouldOverrideURLLoading: url)
+        return (shouldCancel ? .cancel : .allow, preferences)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard let engine else { return }
+        navigationDelegate.webEngineDidStartProvisionalNavigation(engine)
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard let engine else { return }
+        navigationDelegate.webEngineDidCommitNavigation(engine)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let engine else { return }
+        navigationDelegate.webEngineDidFinishNavigation(engine)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard let engine else { return }
+        navigationDelegate.webEngine(engine, didFailNavigation: error)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard let engine else { return }
+        navigationDelegate.webEngine(engine, didFailNavigation: error)
+    }
+}
+#endif
 
 struct AndroidCosmeticInjectionPlan {
     var documentStartRules: [AndroidCosmeticRule] = []
@@ -1196,6 +1300,7 @@ extension WebCookie {
         "WebEngine: \(webView)"
     }
     private var observers: [NSKeyValueObservation] = []
+    private var configurationNavigationDelegate: WebEngineConfigurationNavigationDelegate?
     private var profileSetupError: WebProfileError?
     private var iosContentBlockerSetupTask: Task<[WebContentBlockerError], Never>?
     #else
@@ -1251,9 +1356,26 @@ extension WebCookie {
         super.init()
 
         #if !SKIP
+        installConfigurationNavigationDelegateIfNeeded()
         scheduleIOSContentBlockerSetupIfNeeded()
         #endif
     }
+
+    #if !SKIP
+    /// Installs the configuration delegate before a detached engine begins navigation.
+    private func installConfigurationNavigationDelegateIfNeeded() {
+        guard webView.navigationDelegate == nil,
+              let navigationDelegate = configuration.navigationDelegate else {
+            return
+        }
+        let adapter = WebEngineConfigurationNavigationDelegate(
+            engine: self,
+            navigationDelegate: navigationDelegate
+        )
+        configurationNavigationDelegate = adapter
+        webView.navigationDelegate = adapter
+    }
+    #endif
 
     public func reload() {
         if profileSetupError != nil {
@@ -1426,6 +1548,41 @@ extension WebCookie {
 
     static func profileValidationError(for profile: WebProfile) -> WebProfileError? {
         WebProfilePolicy.validationError(for: profile)
+    }
+
+    /// Clears the platform storage owned by one session-scoped ephemeral profile.
+    ///
+    /// Android keeps the named profile container because `ProfileStore.deleteProfile` rejects
+    /// profiles loaded during the current process. `WebStorageCompat.deleteBrowsingData` removes
+    /// its cookies, caches, site storage, and service workers without depending on object lifetime.
+    @MainActor
+    @discardableResult
+    public static func clearEphemeralSessionProfile(identifier: String) async throws -> Bool {
+        let profile = WebProfile.ephemeralSession(identifier)
+        guard let normalizedIdentifier = profile.normalizedEphemeralSessionIdentifier else {
+            throw WebProfileError.invalidProfileName
+        }
+
+        #if SKIP
+        guard isAndroidMultiProfileSupported() else {
+            throw WebProfileError.unsupportedOnAndroid
+        }
+        let profileName = androidEphemeralSessionProfileName(for: normalizedIdentifier)
+        guard let androidProfile = ProfileStore.getInstance().getProfile(profileName) else {
+            return false
+        }
+        suspendCoroutine { continuation in
+            WebStorageCompat.deleteBrowsingData(
+                androidProfile.getWebStorage(),
+                Dispatchers.Default.asExecutor()
+            ) {
+                continuation.resumeWith(kotlin.Result.success(Unit))
+            }
+        }
+        return true
+        #else
+        return EphemeralSessionWebsiteDataStores.release(identifier: normalizedIdentifier)
+        #endif
     }
 
     private func throwProfileSetupErrorIfNeeded() throws {
@@ -1606,6 +1763,22 @@ extension WebCookie {
                     resolvedProfile: .named(identifier)
                 )
             )
+        case .ephemeralSession:
+            guard let identifier = profile.normalizedEphemeralSessionIdentifier else {
+                return .failure(.invalidProfileName)
+            }
+            let profileName = androidEphemeralSessionProfileName(for: identifier)
+            guard applyAndroidProfile(profileName, to: webView) else {
+                return .failure(.profileSetupFailed)
+            }
+            let profile = WebViewCompat.getProfile(webView)
+            return .success(
+                AndroidProfileResources(
+                    cookieManager: profile.getCookieManager(),
+                    webStorage: profile.getWebStorage(),
+                    resolvedProfile: .named(profileName)
+                )
+            )
         case .named:
             guard let identifier = profile.normalizedNamedIdentifier else {
                 return .failure(.invalidProfileName)
@@ -1658,6 +1831,10 @@ extension WebCookie {
 
     private static func androidEphemeralProfileIdentifier() -> String {
         "skipweb-ephemeral-\(UUID().uuidString)"
+    }
+
+    private static func androidEphemeralSessionProfileName(for identifier: String) -> String {
+        "skipweb-ephemeral-session-\(identifier)"
     }
 
     private static func applyAndroidProfile(_ identifier: String, to webView: PlatformWebView) -> Bool {
@@ -3703,6 +3880,9 @@ final class AndroidEngineWebViewClient : android.webkit.WebViewClient {
         engine?.androidContentBlockerController.recoverIfNeeded(for: url, in: view)
         engine?.androidContentBlockerController.injectIfNeeded(into: view)
         embeddedNavigationClient?.onPageCommitVisible(view, url)
+        if let engine {
+            engine.androidNavigationDelegate?.webEngineDidCommitNavigation(engine)
+        }
         legacyNavigationDelegate?.onPageCommitVisible(view, url)
     }
 
@@ -3750,7 +3930,7 @@ final class AndroidEngineWebViewClient : android.webkit.WebViewClient {
         engine?.androidContentBlockerController.injectIfNeeded(into: view)
         embeddedNavigationClient?.onPageStarted(view, url, favicon)
         if let engine {
-            engine.androidNavigationDelegate?.webEngineDidCommitNavigation(engine)
+            engine.androidNavigationDelegate?.webEngineDidStartProvisionalNavigation(engine)
         }
         legacyNavigationDelegate?.onPageStarted(view, url, favicon)
     }
@@ -4543,6 +4723,11 @@ public struct WebContextMenuAction {
             return WKWebsiteDataStore.default()
         case .ephemeral:
             return WKWebsiteDataStore.nonPersistent()
+        case .ephemeralSession:
+            guard let identifier = profile.normalizedEphemeralSessionIdentifier else {
+                return WKWebsiteDataStore.nonPersistent()
+            }
+            return EphemeralSessionWebsiteDataStores.store(for: identifier)
         case .named(let identifier):
             guard let dataStoreIdentifier = webKitDataStoreIdentifier(for: identifier) else {
                 return WKWebsiteDataStore.default()
