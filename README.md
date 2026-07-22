@@ -607,21 +607,34 @@ using `SkipWebSnapshotConfiguration`, which mirrors the core `WKSnapshotConfigur
 - `rect` (`.null` captures the full visible web view bounds)
 - `snapshotWidth` (output width while preserving aspect ratio)
 - `afterScreenUpdates`
+- `androidCaptureMode` (`.webViewContent` by default, or `.visibleWindowPixels`)
+- `imageFormat` (`.jpeg(quality: 0.85)` by default, or `.png`)
 
 ```swift
 let snapshot = try await navigator.takeSnapshot(
     configuration: SkipWebSnapshotConfiguration(
         rect: .null,
         snapshotWidth: 240,
-        afterScreenUpdates: true
+        afterScreenUpdates: true,
+        androidCaptureMode: .webViewContent,
+        imageFormat: .jpeg(quality: 0.85)
     )
 )
 
-let png = snapshot.pngData
+let imageData = snapshot.imageData
+let mimeType = snapshot.imageFormat.mimeType
 ```
 
-On Android, `afterScreenUpdates` is best-effort: SkipWeb captures on the next UI tick before drawing the `WebView` into a bitmap.
-If that UI-tick wait cannot be scheduled (for example, when the view is detached), `takeSnapshot` throws `WebSnapshotError.afterScreenUpdatesUnavailable`.
+On Android, capture timing and capture source are independent:
+
+| Mode | Captures |
+| --- | --- |
+| `.webViewContent` | The WebView's rendered content, using `WebView.draw(Canvas)`. The capture compensates for the current scroll offset and excludes other window content, including overlays and blur effects. Some video, surface, or other compositor-backed content may not appear. |
+| `.visibleWindowPixels` | The final pixels currently composited inside the WebView's window rectangle, using `PixelCopy`. This includes WebView content and anything drawn over it, including overlays and blur effects. |
+
+`afterScreenUpdates` waits for the next UI tick before either capture mode. If the wait cannot be scheduled, `takeSnapshot` throws `WebSnapshotError.afterScreenUpdatesUnavailable`.
+
+SkipWeb does not switch between these modes automatically. `.visibleWindowPixels` requires the WebView to be attached to a valid window. If PixelCopy is unavailable or fails, `takeSnapshot` throws `WebSnapshotError.visibleWindowPixelsCaptureFailed`.
 
 ### Link Context Menu (long-press)
 
