@@ -596,6 +596,7 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
 
     private func inheritParentConfiguration(for childEngine: WebEngine) -> Bool {
         let parentConfig = webEngine.configuration
+        childEngine.inheritAndroidContentBlockerRuntimeIfNeeded(from: webEngine)
         if let profileError = childEngine.inheritAndroidProfile(from: parentConfig) {
             logger.error("onCreateWindow: failed to inherit parent WebProfile \(String(describing: parentConfig.profile)): \(String(describing: profileError))")
             return false
@@ -650,7 +651,8 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
         let params = AndroidCreateWindowParams(
             isDialog: isDialog,
             isUserGesture: isUserGesture,
-            resultMessage: resultMsg
+            resultMessage: resultMsg,
+            parentConfigurationSnapshot: webEngine.configuration
         )
 
         let childEngine: WebEngine?
@@ -940,7 +942,10 @@ extension WebView : ViewRepresentable {
 
         if resolvedEngine.reused {
             for messageHandlerName in coordinator.messageHandlerNames {
-                web.webView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
+                web.webView.configuration.userContentController.removeScriptMessageHandler(
+                    forName: messageHandlerName,
+                    contentWorld: .page
+                )
             }
         }
         _ = setupWebView(web, coordinator: coordinator)

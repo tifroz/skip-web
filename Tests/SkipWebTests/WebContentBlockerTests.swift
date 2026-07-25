@@ -129,6 +129,88 @@ final class WebContentBlockerTests: XCTestCase {
         XCTAssertEqual(mirroredProvider.navigationCosmeticRules(for: AndroidPageContext(url: URL(string: "https://example.com")!)).count, 1)
     }
 
+    // Verifies the compatibility contentBlockers property resolves once and is shared by children.
+    @MainActor
+    func testPopupChildMirroredConfigurationSharesImplicitRuntime() {
+        let configuration = WebEngineConfiguration(
+            contentBlockers: WebContentBlockerConfiguration(
+                androidMode: .custom(StaticContentBlockingProvider())
+            )
+        )
+
+        let firstChild = configuration.popupChildMirroredConfiguration()
+        let secondChild = configuration.popupChildMirroredConfiguration()
+
+        XCTAssertNotNil(firstChild.contentBlockerRuntime)
+        XCTAssertTrue(firstChild.contentBlockerRuntime === secondChild.contentBlockerRuntime)
+    }
+
+    // Verifies independently created configurations can explicitly reuse one prepared runtime.
+    @MainActor
+    func testExplicitContentBlockerRuntimeIsPreservedByConfigurationAndPopupMirror() {
+        let runtime = WebContentBlockerRuntime(
+            configuration: WebContentBlockerConfiguration(
+                androidMode: .custom(StaticContentBlockingProvider())
+            )
+        )
+        let configuration = WebEngineConfiguration(contentBlockerRuntime: runtime)
+        let mirrored = configuration.popupChildMirroredConfiguration()
+
+        XCTAssertTrue(configuration.contentBlockerRuntime === runtime)
+        XCTAssertTrue(mirrored.contentBlockerRuntime === runtime)
+    }
+
+    // Verifies explicit reapplication advances one shared revision without replacing the runtime.
+    @MainActor
+    func testContentBlockerRuntimeReapplyAdvancesRevision() async {
+        let runtime = WebContentBlockerRuntime(configuration: WebContentBlockerConfiguration())
+
+        let errors = await runtime.reapply(
+            configuration: WebContentBlockerConfiguration(
+                whitelistedDomains: ["example.com"]
+            )
+        )
+
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(runtime.revision, 1)
+        XCTAssertEqual(runtime.configuration.whitelistedDomains, ["example.com"])
+    }
+
+    // Verifies the fixed bootstrap's native filtering retains origin, domain, URL, and frame guards.
+    func testAndroidCosmeticCSSFiltersRulesBeforeReturningBootstrapCSS() throws {
+        let rule = AndroidCosmeticRule(
+            hiddenSelectors: [".sponsored"],
+            urlFilterPattern: "/article/",
+            allowedOriginRules: ["https://*.example.com"],
+            ifDomainList: ["news.example.com"],
+            frameScope: .mainFrameOnly
+        )
+        let matchingURL = try XCTUnwrap(URL(string: "https://news.example.com/article/1"))
+        let nonmatchingURL = try XCTUnwrap(URL(string: "https://news.example.com/home"))
+
+        XCTAssertEqual(
+            WebEngine.androidCosmeticCSS(
+                rules: [rule],
+                pageURL: matchingURL,
+                isMainFrame: true,
+                preferredTiming: AndroidCosmeticInjectionTiming.documentStart
+            ),
+            [".sponsored { display: none !important; }"]
+        )
+        XCTAssertTrue(WebEngine.androidCosmeticCSS(
+            rules: [rule],
+            pageURL: matchingURL,
+            isMainFrame: false,
+            preferredTiming: AndroidCosmeticInjectionTiming.documentStart
+        ).isEmpty)
+        XCTAssertTrue(WebEngine.androidCosmeticCSS(
+            rules: [rule],
+            pageURL: nonmatchingURL,
+            isMainFrame: true,
+            preferredTiming: AndroidCosmeticInjectionTiming.documentStart
+        ).isEmpty)
+    }
+
     // Verifies whitelist entries normalize for stable matching and cache behavior.
     func testWhitelistedDomainsNormalizeForStableBehavior() {
         let contentBlockers = WebContentBlockerConfiguration(
