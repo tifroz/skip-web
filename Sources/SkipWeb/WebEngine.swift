@@ -1464,6 +1464,22 @@ extension WebCookie {
 }
 #endif
 
+#if !SKIP
+/// Forwards WebKit script messages without letting `WKUserContentController` retain its engine.
+@MainActor
+private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    private weak var webEngine: WebEngine?
+
+    init(webEngine: WebEngine) {
+        self.webEngine = webEngine
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        webEngine?.userContentController(userContentController, didReceive: message)
+    }
+}
+#endif
+
 /// An web engine that holds a system web view:
 /// [`WebKit.WKWebView`](https://developer.apple.com/documentation/webkit/wkwebview) on iOS and
 /// [`android.webkit.WebView`](https://developer.android.com/reference/android/webkit/WebView) on Android
@@ -1490,6 +1506,7 @@ extension WebCookie {
     private var configurationNavigationDelegate: WebEngineConfigurationNavigationDelegate?
     private var profileSetupError: WebProfileError?
     private var iosContentBlockerSetupTask: Task<[WebContentBlockerError], Never>?
+    private lazy var weakScriptMessageHandler = WeakWebEngineScriptMessageHandler(webEngine: self)
     #else
     private var profileSetupError: WebProfileError?
     private var androidProfileCookieManager: android.webkit.CookieManager?
@@ -3543,7 +3560,7 @@ extension WebCookie {
         for messageHandlerName in systemMessageHandlers + Array(configuration.allRegisteredMessageHandlerNames) {
             // Sometimes we reuse an underlying WKWebView for a new SwiftUI component.
             userContentController.removeScriptMessageHandler(forName: messageHandlerName, contentWorld: .page)
-            userContentController.add(self, contentWorld: .page, name: messageHandlerName)
+            userContentController.add(weakScriptMessageHandler, contentWorld: .page, name: messageHandlerName)
             registeredMessageHandlerNames.insert(messageHandlerName)
         }
         for missing in registeredMessageHandlerNames.subtracting(Set(systemMessageHandlers).union(configuration.allRegisteredMessageHandlerNames)) {
@@ -4342,6 +4359,7 @@ public extension WebKitCreateWindowParams {
         let childEngine = WebEngine(configuration: effectiveConfiguration, webView: childWebView)
         childEngine.refreshMessageHandlers()
         childEngine.updateUserScripts()
+        logger.info("created popup child WebEngine: \(childEngine)")
         return childEngine
     }
 
