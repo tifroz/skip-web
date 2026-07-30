@@ -177,7 +177,10 @@ final class WebProfileSegregationTests: XCTestCase {
 
         engineA = nil
         engineB = nil
-        XCTAssertTrue(try await WebEngine.clearEphemeralSessionProfile(identifier: identifier))
+        let didClearSession = try await WebEngine.clearEphemeralSessionProfile(
+            identifier: identifier
+        )
+        XCTAssertTrue(didClearSession)
 
         var replacement: WebEngine? = await makeCookieTestEngine(profile: profile)
         let replacementHeader = await replacement?.cookieHeader(for: requestURL)

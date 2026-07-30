@@ -152,6 +152,7 @@ final class WebContentBlockerTests: XCTestCase {
     }
 
     // Verifies popup child configurations retain the parent's blocker settings.
+    @MainActor
     func testPopupChildMirroredConfigurationPreservesAndroidBlockingMode() {
         let provider = StaticContentBlockingProvider(
             decision: AndroidRequestBlockDecision.block,
@@ -337,6 +338,7 @@ final class WebContentBlockerTests: XCTestCase {
     #endif
 
     // Verifies the fixed bootstrap's native filtering retains origin, domain, URL, and frame guards.
+    #if SKIP
     func testAndroidCosmeticCSSFiltersRulesBeforeReturningBootstrapCSS() throws {
         let rule = AndroidCosmeticRule(
             hiddenSelectors: [".sponsored"],
@@ -370,6 +372,7 @@ final class WebContentBlockerTests: XCTestCase {
             preferredTiming: AndroidCosmeticInjectionTiming.documentStart
         ).isEmpty)
     }
+    #endif
 
     // Verifies whitelist entries normalize for stable matching and cache behavior.
     func testWhitelistedDomainsNormalizeForStableBehavior() {
@@ -479,6 +482,7 @@ final class WebContentBlockerTests: XCTestCase {
     }
 
     // Verifies popup child configurations preserve the new app-facing navigation delegate.
+    @MainActor
     func testPopupChildMirroredConfigurationPreservesNavigationDelegate() {
         let config = WebEngineConfiguration(navigationDelegate: TestNavigationDelegate())
         let mirrored = config.popupChildMirroredConfiguration()

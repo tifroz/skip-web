@@ -219,12 +219,14 @@ final class SkipWebTests: XCTestCase {
         XCTAssertTrue(config.capturesConsoleOutput)
     }
 
+    @MainActor
     func testPopupChildMirroredConfigurationPreservesProfile() {
         let config = WebEngineConfiguration(profile: .named("popup-profile"))
         let mirrored = config.popupChildMirroredConfiguration()
         XCTAssertEqual(mirrored.profile, .named("popup-profile"))
     }
 
+    @MainActor
     func testPopupChildMirroredConfigurationPreservesConsoleCapture() {
         let config = WebEngineConfiguration(capturesConsoleOutput: false)
         let mirrored = config.popupChildMirroredConfiguration()
