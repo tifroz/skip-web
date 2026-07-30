@@ -39,10 +39,65 @@ final class WebContentBlockerTests: XCTestCase {
         }
     }
 
+    final class HostScopedContentBlockingProvider: AndroidContentBlockingProvider {
+        let mainPageHost: String
+        let rule: AndroidCosmeticRule
+        var requestedPageURLs: [URL] = []
+
+        init(mainPageHost: String, rule: AndroidCosmeticRule) {
+            self.mainPageHost = mainPageHost
+            self.rule = rule
+        }
+
+        var persistentCosmeticRules: [AndroidCosmeticRule] {
+            []
+        }
+
+        func navigationCosmeticRules(for page: AndroidPageContext) -> [AndroidCosmeticRule] {
+            requestedPageURLs.append(page.url)
+            if page.url.host == mainPageHost {
+                return [rule]
+            }
+            return []
+        }
+    }
+
     final class TestNavigationDelegate: SkipWebNavigationDelegate {
     }
 
     #if !SKIP
+    @MainActor
+    final class ControlledIOSContentBlockerPreparer {
+        private var continuations: [String: CheckedContinuation<PreparedContentBlockerRuleLists, Never>] = [:]
+        private var invocationWaiters: [String: CheckedContinuation<Void, Never>] = [:]
+
+        func prepare(sourcePaths: [String]) async -> PreparedContentBlockerRuleLists {
+            let key = sourcePaths.first ?? ""
+            return await withCheckedContinuation { continuation in
+                continuations[key] = continuation
+                invocationWaiters.removeValue(forKey: key)?.resume()
+            }
+        }
+
+        func waitUntilInvoked(_ key: String) async {
+            if continuations[key] != nil {
+                return
+            }
+            await withCheckedContinuation { continuation in
+                invocationWaiters[key] = continuation
+            }
+        }
+
+        func complete(_ key: String, errors: [WebContentBlockerError]) {
+            continuations.removeValue(forKey: key)?.resume(
+                returning: PreparedContentBlockerRuleLists(
+                    ruleLists: [],
+                    errors: errors
+                )
+            )
+        }
+    }
+
     @MainActor
     func contentBlockerTestDirectory() -> URL {
         URL.temporaryDirectory
@@ -175,6 +230,111 @@ final class WebContentBlockerTests: XCTestCase {
         XCTAssertEqual(runtime.revision, 1)
         XCTAssertEqual(runtime.configuration.whitelistedDomains, ["example.com"])
     }
+
+    #if !SKIP
+    // Verifies a superseded preparation cannot replace or return an older rule snapshot.
+    @MainActor
+    func testContentBlockerRuntimeDiscardsStaleIOSPreparationResult() async {
+        let oldPath = "/tmp/old-rules.json"
+        let newPath = "/tmp/new-rules.json"
+        let oldError = WebContentBlockerError.operationTimedOut("old revision")
+        let newError = WebContentBlockerError.operationTimedOut("new revision")
+        let preparer = ControlledIOSContentBlockerPreparer()
+        let runtime = WebContentBlockerRuntime(
+            configuration: WebContentBlockerConfiguration(iOSRuleListPaths: [oldPath]),
+            iosRuleListPreparer: { sourcePaths, _, _ in
+                await preparer.prepare(sourcePaths: sourcePaths)
+            }
+        )
+
+        let oldPreparation = Task { @MainActor in
+            await runtime.prepare()
+        }
+        await preparer.waitUntilInvoked(oldPath)
+
+        let reapplication = Task { @MainActor in
+            await runtime.reapply(
+                configuration: WebContentBlockerConfiguration(iOSRuleListPaths: [newPath])
+            )
+        }
+        await preparer.waitUntilInvoked(newPath)
+
+        preparer.complete(newPath, errors: [newError])
+        _ = await reapplication.value
+        preparer.complete(oldPath, errors: [oldError])
+
+        let oldPreparationErrors = await oldPreparation.value
+        let currentErrors = await runtime.prepare()
+        XCTAssertEqual(oldPreparationErrors, [newError])
+        XCTAssertEqual(currentErrors, [newError])
+        XCTAssertEqual(runtime.revision, 1)
+    }
+
+    // Verifies clearing the compatibility property removes the rules from its existing runtime.
+    @MainActor
+    func testReapplyContentBlockersDisablesClearedCompatibilityConfiguration() async throws {
+        let configuration = WebEngineConfiguration(
+            contentBlockers: WebContentBlockerConfiguration(
+                whitelistedDomains: ["example.com"]
+            )
+        )
+        let engine = WebEngine(configuration: configuration)
+        let runtime = try XCTUnwrap(engine.contentBlockerRuntime)
+
+        configuration.contentBlockers = nil
+        let errors = await engine.reapplyContentBlockers()
+
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(runtime.revision, 1)
+        XCTAssertTrue(runtime.configuration.iOSRuleListPaths.isEmpty)
+        XCTAssertTrue(runtime.configuration.whitelistedDomains.isEmpty)
+        XCTAssertNil(runtime.configuration.effectiveAndroidProvider)
+    }
+
+    // Verifies the compatibility property can enable blockers after the engine was created.
+    @MainActor
+    func testReapplyContentBlockersCreatesCompatibilityRuntimeWhenEnabledLater() async throws {
+        let configuration = WebEngineConfiguration()
+        let engine = WebEngine(configuration: configuration)
+        XCTAssertNil(engine.contentBlockerRuntime)
+
+        configuration.contentBlockers = WebContentBlockerConfiguration(
+            whitelistedDomains: ["enabled.example.com"]
+        )
+        let errors = await engine.reapplyContentBlockers()
+        let runtime = try XCTUnwrap(engine.contentBlockerRuntime)
+
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(runtime.revision, 1)
+        XCTAssertEqual(runtime.configuration.whitelistedDomains, ["enabled.example.com"])
+        XCTAssertTrue(
+            configuration.popupChildMirroredConfiguration().contentBlockerRuntime === runtime
+        )
+    }
+
+    // Verifies the compatibility property cannot replace an explicitly supplied shared runtime.
+    @MainActor
+    func testReapplyContentBlockersKeepsExplicitRuntimeAuthoritative() async {
+        let runtime = WebContentBlockerRuntime(
+            configuration: WebContentBlockerConfiguration(
+                whitelistedDomains: ["runtime.example.com"]
+            )
+        )
+        let configuration = WebEngineConfiguration(
+            contentBlockers: WebContentBlockerConfiguration(
+                whitelistedDomains: ["compatibility.example.com"]
+            ),
+            contentBlockerRuntime: runtime
+        )
+        let engine = WebEngine(configuration: configuration)
+
+        let errors = await engine.reapplyContentBlockers()
+
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(runtime.revision, 1)
+        XCTAssertEqual(runtime.configuration.whitelistedDomains, ["runtime.example.com"])
+    }
+    #endif
 
     // Verifies the fixed bootstrap's native filtering retains origin, domain, URL, and frame guards.
     func testAndroidCosmeticCSSFiltersRulesBeforeReturningBootstrapCSS() throws {
@@ -373,6 +533,152 @@ final class WebContentBlockerTests: XCTestCase {
     }
 
     #if SKIP
+    // Verifies a main-page rule remains selected while its frame guards are evaluated against an iframe URL.
+    func testAndroidDocumentStartBridgeUsesMainPageToSelectSubframeRules() throws {
+        let mainPageURL = try XCTUnwrap(URL(string: "https://publisher.example/article"))
+        let subframeURL = try XCTUnwrap(URL(string: "https://ads.example/frame"))
+        let provider = HostScopedContentBlockingProvider(
+            mainPageHost: "publisher.example",
+            rule: AndroidCosmeticRule(
+                hiddenSelectors: [".sponsored-frame"],
+                frameScope: .allFrames
+            )
+        )
+        let configuration = WebContentBlockerConfiguration(
+            androidMode: .custom(provider)
+        )
+        let runtime = WebContentBlockerRuntime(configuration: configuration)
+        let controller = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: runtime
+        )
+
+        _ = controller.documentStartCSS(frameURL: mainPageURL, isMainFrame: true)
+        let subframeCSS = controller.documentStartCSS(
+            frameURL: subframeURL,
+            isMainFrame: false
+        )
+
+        XCTAssertEqual(
+            subframeCSS,
+            ".sponsored-frame { display: none !important; }"
+        )
+        XCTAssertEqual(provider.requestedPageURLs, [mainPageURL])
+    }
+
+    // Verifies whitelisting the main page suppresses cosmetic rules in every child frame.
+    func testAndroidDocumentStartBridgeAppliesMainPageWhitelistToSubframes() throws {
+        let mainPageURL = try XCTUnwrap(URL(string: "https://publisher.example/article"))
+        let subframeURL = try XCTUnwrap(URL(string: "https://ads.example/frame"))
+        let provider = HostScopedContentBlockingProvider(
+            mainPageHost: "publisher.example",
+            rule: AndroidCosmeticRule(
+                hiddenSelectors: [".sponsored-frame"],
+                frameScope: .allFrames
+            )
+        )
+        let configuration = WebContentBlockerConfiguration(
+            whitelistedDomains: ["publisher.example"],
+            androidMode: .custom(provider)
+        )
+        let runtime = WebContentBlockerRuntime(configuration: configuration)
+        let controller = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: runtime
+        )
+
+        let mainFrameCSS = controller.documentStartCSS(
+            frameURL: mainPageURL,
+            isMainFrame: true
+        )
+        let subframeCSS = controller.documentStartCSS(
+            frameURL: subframeURL,
+            isMainFrame: false
+        )
+
+        XCTAssertTrue(mainFrameCSS.isEmpty)
+        XCTAssertTrue(subframeCSS.isEmpty)
+        XCTAssertTrue(provider.requestedPageURLs.isEmpty)
+    }
+
+    // Verifies engines sharing one runtime keep independent main-page navigation snapshots.
+    func testAndroidDocumentStartBridgeKeepsSharedRuntimeSnapshotsPerController() throws {
+        let selectedMainPageURL = try XCTUnwrap(
+            URL(string: "https://publisher.example/article")
+        )
+        let otherMainPageURL = try XCTUnwrap(
+            URL(string: "https://other.example/article")
+        )
+        let subframeURL = try XCTUnwrap(URL(string: "https://ads.example/frame"))
+        let provider = HostScopedContentBlockingProvider(
+            mainPageHost: "publisher.example",
+            rule: AndroidCosmeticRule(
+                hiddenSelectors: [".sponsored-frame"],
+                frameScope: .allFrames
+            )
+        )
+        let configuration = WebContentBlockerConfiguration(
+            androidMode: .custom(provider)
+        )
+        let runtime = WebContentBlockerRuntime(configuration: configuration)
+        let selectedController = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: runtime
+        )
+        let otherController = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: runtime
+        )
+
+        _ = selectedController.documentStartCSS(
+            frameURL: selectedMainPageURL,
+            isMainFrame: true
+        )
+        _ = otherController.documentStartCSS(
+            frameURL: otherMainPageURL,
+            isMainFrame: true
+        )
+
+        XCTAssertFalse(
+            selectedController.documentStartCSS(
+                frameURL: subframeURL,
+                isMainFrame: false
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            otherController.documentStartCSS(
+                frameURL: subframeURL,
+                isMainFrame: false
+            ).isEmpty
+        )
+    }
+
+    // Verifies pre-navigation preparation is reused once, while a later same-URL navigation refreshes its rules.
+    func testAndroidDocumentStartBridgeConsumesPreparedMainPageSnapshotOnce() throws {
+        let mainPageURL = try XCTUnwrap(URL(string: "https://publisher.example/article"))
+        let provider = HostScopedContentBlockingProvider(
+            mainPageHost: "publisher.example",
+            rule: AndroidCosmeticRule(hiddenSelectors: [".sponsored"])
+        )
+        let configuration = WebContentBlockerConfiguration(
+            androidMode: .custom(provider)
+        )
+        let runtime = WebContentBlockerRuntime(configuration: configuration)
+        let controller = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: runtime
+        )
+        let context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
+        let webView = PlatformWebView(context)
+
+        controller.prepare(for: mainPageURL, in: webView)
+        _ = controller.documentStartCSS(frameURL: mainPageURL, isMainFrame: true)
+        XCTAssertEqual(provider.requestedPageURLs, [mainPageURL])
+
+        _ = controller.documentStartCSS(frameURL: mainPageURL, isMainFrame: true)
+        XCTAssertEqual(provider.requestedPageURLs, [mainPageURL, mainPageURL])
+    }
+
     // Verifies assigning the deprecated engineDelegate no longer replaces the engine-owned WebViewClient.
     func testAndroidLegacyEngineDelegateDoesNotReplaceInternalWebViewClient() {
         let engine = WebEngine(

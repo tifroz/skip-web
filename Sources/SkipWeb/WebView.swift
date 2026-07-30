@@ -129,7 +129,9 @@ public struct WebDownloadRequest: Equatable, Hashable, Sendable {
 ///
 /// For single-page flows, a navigator is usually enough to keep one browser runtime warm.
 /// For multi-tab browsers, use `persistentWebViewID` so each tab can own and later rebind
-/// its own cached `WebEngine`.
+/// its own cached `WebEngine`. A persistent ID opts into explicit lifetime management:
+/// SkipWeb strongly retains that engine until ``removePersistentWebView(id:)`` or
+/// ``removePersistentWebViews(ids:)`` removes it from the cache.
 public struct WebView : View {
     fileprivate let config: WebEngineConfiguration
     let navigator: WebViewNavigator
@@ -162,8 +164,18 @@ public struct WebView : View {
     /// resume its own history and in-page state after being rebound. Omit
     /// `persistentWebViewID` when the web view does not need cross-mount identity.
     ///
+    /// - Important: A non-`nil` `persistentWebViewID` stores the engine in a process-wide,
+    ///   strongly held cache. Unmounting this view does not release the engine, and SkipWeb
+    ///   does not automatically evict engines for memory pressure or limit the cache size.
+    ///   Call ``removePersistentWebView(id:)`` when the tab closes or is evicted from the
+    ///   app's warm-tab pool. Each retained engine can keep a native web view, page state,
+    ///   history, and related browser resources in memory.
+    ///
     /// - Parameter shouldOverrideUrlLoading: Called with the requested URL and whether
     ///   the navigation targets the main frame. Return `true` to cancel the navigation.
+    /// - Parameter persistentWebViewID: A stable cache key for explicit cross-mount engine
+    ///   retention. IDs share one process-wide namespace. The same ID resolves to the first
+    ///   cached engine—and its original configuration—until it is removed.
     public init(
         configuration: WebEngineConfiguration = WebEngineConfiguration(),
         navigator: WebViewNavigator = WebViewNavigator(),
@@ -196,11 +208,50 @@ public struct WebView : View {
         self.persistentWebViewID = persistentWebViewID
     }
 
+    /// Creates an embedded web view using the original URL-only navigation callback.
+    @available(*, deprecated, message: "Use shouldOverrideUrlLoading with a closure that accepts both the URL and isMainFrame.")
+    public init(
+        configuration: WebEngineConfiguration = WebEngineConfiguration(),
+        navigator: WebViewNavigator = WebViewNavigator(),
+        url initialURL: URL? = nil,
+        html initialHTML: String? = nil,
+        state: Binding<WebViewState> = .constant(WebViewState()),
+        scrollDelegate: (any SkipWebScrollDelegate)? = nil,
+        onNavigationCommitted: (() -> Void)? = nil,
+        onNavigationFinished: (() -> Void)? = nil,
+        onNavigationFailed: (() -> Void)? = nil,
+        onDownloadRequested: ((WebDownloadRequest) -> Void)? = nil,
+        shouldOverrideUrlLoading: @escaping (_ url: URL) -> Bool,
+        persistentWebViewID: String? = nil
+    ) {
+        self.init(
+            configuration: configuration,
+            navigator: navigator,
+            url: initialURL,
+            html: initialHTML,
+            state: state,
+            scrollDelegate: scrollDelegate,
+            onNavigationCommitted: onNavigationCommitted,
+            onNavigationFinished: onNavigationFinished,
+            onNavigationFailed: onNavigationFailed,
+            onDownloadRequested: onDownloadRequested,
+            shouldOverrideUrlLoading: { url, _ in
+                shouldOverrideUrlLoading(url)
+            },
+            persistentWebViewID: persistentWebViewID
+        )
+    }
+
     /// Removes one cached persistent web view so the next mount recreates its engine.
     ///
-    /// Think of it as explicitly dropping one parked browser engine from the shared cache.
-    /// Multi-tab hosts should call this when a tab closes or when a background tab should
-    /// no longer keep a live engine in memory.
+    /// Call this after the view using the ID has been unmounted. On Android, removal also
+    /// destroys the cached native web view, so removing an engine that is still mounted is
+    /// unsupported. The method does nothing when the ID is not cached.
+    ///
+    /// Removing the cache entry releases SkipWeb's strong reference. It does not force
+    /// deallocation while a navigator, mounted view, or application-owned reference still
+    /// retains the engine. Do not use any remaining reference after Android removal because
+    /// its native web view has been destroyed.
     @MainActor
     public static func removePersistentWebView(id: String) {
         guard let engine = engineCache.removeValue(forKey: id) else {
@@ -213,9 +264,10 @@ public struct WebView : View {
 
     /// Removes multiple cached persistent web views so the next mount recreates their engines.
     ///
-    /// Think of it as a bulk purge for parked browser engines that should no longer stay warm.
-    /// This is useful when a browser feature trims its warm tab pool after memory pressure
-    /// or session changes.
+    /// Use this after the corresponding views have been unmounted when trimming a warm-tab
+    /// pool, responding to memory pressure, ending a session, or closing multiple tabs.
+    /// As with ``removePersistentWebView(id:)``, other strong references can keep an engine
+    /// alive after its cache entry is removed.
     @MainActor
     public static func removePersistentWebViews(ids: [String]) {
         for id in ids {

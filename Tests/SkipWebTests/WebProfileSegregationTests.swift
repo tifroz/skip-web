@@ -52,6 +52,19 @@ final class WebProfileSegregationTests: XCTestCase {
             WebProfilePolicy.androidSupportError(for: WebProfile.named(" "), isMultiProfileFeatureSupported: true),
             WebProfileError.invalidProfileName
         )
+        let internalSessionProfileName = AndroidWebProfileNamespace.ephemeralSessionProfileName(
+            identifier: "session-a"
+        )
+        XCTAssertEqual(
+            WebProfilePolicy.androidSupportError(
+                for: WebProfile.named(internalSessionProfileName),
+                isMultiProfileFeatureSupported: true
+            ),
+            WebProfileError.invalidProfileName
+        )
+        XCTAssertFalse(
+            AndroidWebProfileNamespace.isReservedNamedProfileIdentifier("android-profile")
+        )
     }
 
     #if SKIP || os(iOS) // These tests create WebEngine/PlatformWebView instances backed by iOS WKWebView/WKWebsiteDataStore APIs or Android WebView; native macOS SwiftPM cannot exercise those runtime APIs.
@@ -62,17 +75,20 @@ final class WebProfileSegregationTests: XCTestCase {
         if isRobolectric {
             throw XCTSkip("WebEngine-backed navigator tests require instrumented Android context")
         }
-        let navigator = WebViewNavigator()
-        navigator.webEngine = await makeCookieTestEngine(profile: .named(" "))
         let requestURL = try XCTUnwrap(URL(string: "https://invalid-profile.example.com/path"))
 
-        do {
-            try await navigator.loadOrThrow(url: requestURL)
-            XCTFail("Expected navigator loadOrThrow to fail for invalid profile")
-        } catch let error as WebProfileError {
-            XCTAssertEqual(error, .invalidProfileName)
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
+        for profile in [WebProfile.named(" "), WebProfile.ephemeralSession(" ")] {
+            let navigator = WebViewNavigator()
+            navigator.webEngine = await makeCookieTestEngine(profile: profile)
+
+            do {
+                try await navigator.loadOrThrow(url: requestURL)
+                XCTFail("Expected navigator loadOrThrow to fail for invalid profile \(profile)")
+            } catch let error as WebProfileError {
+                XCTAssertEqual(error, .invalidProfileName)
+            } catch {
+                XCTFail("Unexpected error type for profile \(profile): \(error)")
+            }
         }
     }
 

@@ -32,6 +32,9 @@ public enum WebProfile: Equatable, Hashable, Sendable {
     /// Uses the platform default persistent website data store.
     case `default`
     /// Uses a persistent website data store isolated by the supplied identifier.
+    ///
+    /// On Android, identifiers beginning with `skipweb-internal-` are reserved for
+    /// SkipWeb-owned profiles and fail with ``WebProfileError/invalidProfileName``.
     case named(String)
     /// Uses an in-memory website data store when the platform supports one.
     ///
@@ -40,9 +43,11 @@ public enum WebProfile: Equatable, Hashable, Sendable {
     case ephemeral
     /// Uses one explicitly owned ephemeral browsing session shared by multiple web views.
     ///
-    /// Call `WebEngine.clearEphemeralSessionProfile(identifier:)` when the session ends.
-    /// On iOS the shared nonpersistent data store is released. On Android all browsing data
-    /// in the corresponding isolated WebView profile is deleted.
+    /// Engines created with the same nonempty identifier share cookies and website data without
+    /// using the default persistent store. Release those engines, then call
+    /// ``WebEngine/clearEphemeralSessionProfile(identifier:)`` when the session ends.
+    /// On iOS the shared nonpersistent data store is released. On Android the corresponding
+    /// isolated WebView profile is kept, but its browsing data is deleted.
     case ephemeralSession(String)
 
     fileprivate var normalizedNamedIdentifier: String? {
@@ -77,6 +82,18 @@ public enum WebProfileError: Error, Equatable {
     case profileSetupFailed
 }
 
+enum AndroidWebProfileNamespace {
+    static let internalPrefix = "skipweb-internal-"
+
+    static func ephemeralSessionProfileName(identifier: String) -> String {
+        "\(internalPrefix)ephemeral-session-\(identifier)"
+    }
+
+    static func isReservedNamedProfileIdentifier(_ identifier: String) -> Bool {
+        identifier.hasPrefix(internalPrefix)
+    }
+}
+
 enum WebProfilePolicy {
     static func validationError(for profile: WebProfile) -> WebProfileError? {
         switch profile {
@@ -102,6 +119,10 @@ enum WebProfilePolicy {
         case .ephemeral, .ephemeralSession:
             return isMultiProfileFeatureSupported ? nil : .unsupportedOnAndroid
         case .named:
+            if let identifier = profile.normalizedNamedIdentifier,
+               AndroidWebProfileNamespace.isReservedNamedProfileIdentifier(identifier) {
+                return .invalidProfileName
+            }
             return isMultiProfileFeatureSupported ? nil : .unsupportedOnAndroid
         }
     }
@@ -415,7 +436,9 @@ public protocol AndroidContentBlockingProvider {
     /// Long-lived cosmetic rules that SkipWeb can reuse across navigations.
     ///
     /// Put CSS here when it acts like a baseline for the whole browsing session rather than
-    /// a rule that depends on the current page URL.
+    /// a rule that depends on the current page URL. The runtime captures this array once per
+    /// revision; call ``WebContentBlockerRuntime/reapply(configuration:reloadLiveWebViews:)``
+    /// after changing the baseline.
     var persistentCosmeticRules: [AndroidCosmeticRule] { get }
     /// Returns the request-blocking decision for an Android resource load.
     func requestDecision(for request: AndroidBlockableRequest) -> AndroidRequestBlockDecision
@@ -542,14 +565,14 @@ public struct AndroidCosmeticRule: Equatable, Sendable {
     public var hiddenSelectors: [String]
     /// Optional regex-style URL filter that must match the current frame URL before the rule applies.
     ///
-    /// Think of it as a runtime frame guard: SkipWeb checks it inside the injected script
-    /// so a rule can stay registered while only applying to matching subframes or redirected pages.
+    /// Think of it as a runtime frame guard: SkipWeb evaluates it before returning CSS to a
+    /// document, so one fixed document-start hook can serve matching subframes and redirected pages.
     public var urlFilterPattern: String?
-    /// Allowed origins used when registering Android document-start scripts.
+    /// Origin patterns that must match the current frame before the rule applies.
     ///
-    /// This is a platform registration scope, not just an in-script filter.
-    /// `WebViewCompat.addDocumentStartJavaScript(...)` requires these origin rules up front,
-    /// so SkipWeb needs them to decide where the script is injected at all.
+    /// When Android document-start scripts are supported, SkipWeb installs one fixed hook for all
+    /// origins and evaluates these patterns in the shared runtime before returning CSS. Use `"*"`
+    /// to allow every origin.
     public var allowedOriginRules: [String]
     /// Host patterns that must match the current frame host before the rule applies.
     public var ifDomainList: [String]
@@ -596,11 +619,20 @@ public struct AndroidCosmeticRule: Equatable, Sendable {
 
 @MainActor
 public protocol SkipWebNavigationDelegate {
+    /// Asks whether a main-frame navigation should be cancelled.
+    ///
+    /// Return `true` after handling a URL in native code. Return `false` to let the web view load it.
     func webEngine(_ engine: WebEngine, shouldOverrideURLLoading url: URL) -> Bool
-    /// Called when the main frame starts provisional navigation and exposes its concrete URL.
+    /// Called when the main frame starts provisional navigation.
+    ///
+    /// At this point ``WebEngine/url`` exposes the concrete URL, including the first URL of a
+    /// detached popup engine before that engine is mounted in a ``WebView``.
     func webEngineDidStartProvisionalNavigation(_ engine: WebEngine)
+    /// Called after the main-frame navigation commits its first content.
     func webEngineDidCommitNavigation(_ engine: WebEngine)
+    /// Called after the main-frame navigation finishes loading.
     func webEngineDidFinishNavigation(_ engine: WebEngine)
+    /// Called when a main-frame provisional or committed navigation fails.
     func webEngine(_ engine: WebEngine, didFailNavigation error: Error)
 }
 
@@ -681,6 +713,12 @@ private final class WebEngineConfigurationNavigationDelegate: NSObject, WKNaviga
 struct AndroidCosmeticInjectionPlan {
     var documentStartRules: [AndroidCosmeticRule] = []
     var lifecycleCSS: [String] = []
+}
+
+struct AndroidCosmeticNavigationSnapshot {
+    let mainPageURL: URL
+    let isWhitelisted: Bool
+    let rules: [AndroidCosmeticRule]
 }
 
 struct AndroidDocumentStartRuleBatchKey: Hashable {
@@ -924,6 +962,9 @@ public enum WebContentBlockerError: Error, Equatable, LocalizedError {
 /// Think of a runtime as one registration lifetime: the first engine prepares the rule snapshot,
 /// popup children inherit it, and independently created engines can opt into the same snapshot.
 /// Call ``reapply(configuration:reloadLiveWebViews:)`` only when the app has changed its rules.
+///
+/// The runtime tracks attached engines weakly. Sharing a runtime does not by itself keep a
+/// `WebEngine` or native web view alive.
 @MainActor public final class WebContentBlockerRuntime {
     /// The configuration represented by the current prepared revision.
     public private(set) var configuration: WebContentBlockerConfiguration
@@ -933,38 +974,100 @@ public enum WebContentBlockerError: Error, Equatable, LocalizedError {
     private var attachedEngines: [WeakContentBlockerEngine] = []
     #if SKIP
     private var androidPersistentRules: [AndroidCosmeticRule] = []
-    private var androidDocumentStartCSSByPage: [String: String] = [:]
     private var androidIsPrepared = false
     #else
     private var preparedIOSRuleLists: [WKContentRuleList] = []
     private var preparedIOSErrors: [WebContentBlockerError] = []
-    private var iosIsPrepared = false
+    private var preparedIOSRevision: Int?
+    private var iosPreparationTask: (
+        revision: Int,
+        task: Task<PreparedContentBlockerRuleLists, Never>
+    )?
+    private let iosRuleListPreparer: @MainActor (
+        _ sourcePaths: [String],
+        _ whitelistedDomains: [String],
+        _ popupWhitelistedSourceDomains: [String]
+    ) async -> PreparedContentBlockerRuleLists
     #endif
 
-    /// Creates a reusable runtime for one content-blocker configuration.
+    /// Creates a reusable runtime for one complete content-blocker configuration.
+    ///
+    /// Pass the same instance as ``WebEngineConfiguration/contentBlockerRuntime`` when multiple
+    /// independently created engines should share preparation and receive the same reapplications.
     public init(configuration: WebContentBlockerConfiguration) {
         self.configuration = configuration
+        #if !SKIP
+        self.iosRuleListPreparer = { sourcePaths, whitelistedDomains, popupWhitelistedSourceDomains in
+            await WebContentBlockerStore.prepareRuleLists(
+                from: sourcePaths,
+                whitelistedDomains: whitelistedDomains,
+                popupWhitelistedSourceDomains: popupWhitelistedSourceDomains
+            )
+        }
+        #endif
     }
+
+    #if !SKIP
+    init(
+        configuration: WebContentBlockerConfiguration,
+        iosRuleListPreparer: @escaping @MainActor (
+            _ sourcePaths: [String],
+            _ whitelistedDomains: [String],
+            _ popupWhitelistedSourceDomains: [String]
+        ) async -> PreparedContentBlockerRuleLists
+    ) {
+        self.configuration = configuration
+        self.iosRuleListPreparer = iosRuleListPreparer
+    }
+    #endif
 
     /// Prepares the shared rule snapshot without requiring a web view.
     ///
     /// Calling this before constructing the first engine moves rule preparation out of the
-    /// user-visible navigation path. Later engines only install a fixed-size platform hook.
+    /// user-visible navigation path. Repeated calls for the same revision reuse the prepared
+    /// result. Later engines only install the prepared result or a fixed-size platform hook.
     @discardableResult
     public func prepare() async -> [WebContentBlockerError] {
         #if SKIP
         prepareAndroidSnapshotIfNeeded()
         return []
         #else
-        if !iosIsPrepared {
-            let prepared = await WebContentBlockerStore.prepareRuleLists(
-                from: configuration.iOSRuleListPaths,
-                whitelistedDomains: configuration.normalizedWhitelistedDomains,
-                popupWhitelistedSourceDomains: configuration.normalizedPopupWhitelistedSourceDomains
-            )
-            preparedIOSRuleLists = prepared.ruleLists
-            preparedIOSErrors = prepared.errors
-            iosIsPrepared = true
+        let targetRevision = revision
+        if preparedIOSRevision == targetRevision {
+            return preparedIOSErrors
+        }
+
+        let task: Task<PreparedContentBlockerRuleLists, Never>
+        if let existingTask = iosPreparationTask,
+           existingTask.revision == targetRevision {
+            task = existingTask.task
+        } else {
+            let sourcePaths = configuration.iOSRuleListPaths
+            let whitelistedDomains = configuration.normalizedWhitelistedDomains
+            let popupWhitelistedSourceDomains = configuration.normalizedPopupWhitelistedSourceDomains
+            let preparer = iosRuleListPreparer
+            task = Task { @MainActor in
+                await preparer(
+                    sourcePaths,
+                    whitelistedDomains,
+                    popupWhitelistedSourceDomains
+                )
+            }
+            iosPreparationTask = (targetRevision, task)
+        }
+
+        let prepared = await task.value
+        // WebKit compilation may still finish after a newer reapply starts. The revision,
+        // rather than task cancellation, is the source of truth for whether this result belongs.
+        guard revision == targetRevision else {
+            return await prepare()
+        }
+
+        preparedIOSRuleLists = prepared.ruleLists
+        preparedIOSErrors = prepared.errors
+        preparedIOSRevision = targetRevision
+        if iosPreparationTask?.revision == targetRevision {
+            iosPreparationTask = nil
         }
         return preparedIOSErrors
         #endif
@@ -976,20 +1079,20 @@ public enum WebContentBlockerError: Error, Equatable, LocalizedError {
     ///   - configuration: The complete replacement blocker configuration.
     ///   - reloadLiveWebViews: Whether attached pages should reload after installing the revision.
     ///     The default preserves the user's current page; request rules then apply to future loads.
+    ///     On Android, cosmetic rules are refreshed on the current page even when this is `false`.
     /// - Returns: Errors produced while preparing or installing the new revision.
     @discardableResult
     public func reapply(
         configuration: WebContentBlockerConfiguration,
         reloadLiveWebViews: Bool = false
     ) async -> [WebContentBlockerError] {
+        #if SKIP
+        replaceAndroidSnapshot(with: configuration)
+        #else
         self.configuration = configuration
         revision += 1
-        #if SKIP
-        androidPersistentRules = configuration.effectiveAndroidProvider?.persistentCosmeticRules ?? []
-        androidDocumentStartCSSByPage.removeAll()
-        androidIsPrepared = true
-        #else
-        iosIsPrepared = false
+        preparedIOSRevision = nil
+        iosPreparationTask = nil
         preparedIOSRuleLists = []
         preparedIOSErrors = []
         _ = await prepare()
@@ -1024,6 +1127,14 @@ public enum WebContentBlockerError: Error, Equatable, LocalizedError {
 
     #if SKIP
     // SKIP INSERT: @kotlin.jvm.Synchronized
+    private func replaceAndroidSnapshot(with configuration: WebContentBlockerConfiguration) {
+        self.configuration = configuration
+        revision += 1
+        androidPersistentRules = configuration.effectiveAndroidProvider?.persistentCosmeticRules ?? []
+        androidIsPrepared = true
+    }
+
+    // SKIP INSERT: @kotlin.jvm.Synchronized
     fileprivate func prepareAndroidSnapshotIfNeeded() {
         guard !androidIsPrepared else { return }
         androidPersistentRules = configuration.effectiveAndroidProvider?.persistentCosmeticRules ?? []
@@ -1039,36 +1150,42 @@ public enum WebContentBlockerError: Error, Equatable, LocalizedError {
     }
 
     // SKIP INSERT: @kotlin.jvm.Synchronized
-    fileprivate func androidCosmeticRules(for pageURL: URL) -> [AndroidCosmeticRule] {
+    func androidNavigationSnapshot(for mainPageURL: URL) -> AndroidCosmeticNavigationSnapshot {
         prepareAndroidSnapshotIfNeeded()
-        if WebContentBlockerConfiguration.matchesWhitelistedURL(
-            pageURL,
+        let isWhitelisted = WebContentBlockerConfiguration.matchesWhitelistedURL(
+            mainPageURL,
             in: configuration.normalizedWhitelistedDomains
-        ) {
-            return []
+        )
+        var rules: [AndroidCosmeticRule] = []
+        if !isWhitelisted {
+            rules = androidPersistentRules
+            if let provider = configuration.effectiveAndroidProvider {
+                rules.append(
+                    contentsOf: provider.navigationCosmeticRules(
+                        for: AndroidPageContext(url: mainPageURL)
+                    )
+                )
+            }
         }
-        var rules = androidPersistentRules
-        if let provider = configuration.effectiveAndroidProvider {
-            rules.append(contentsOf: provider.navigationCosmeticRules(for: AndroidPageContext(url: pageURL)))
-        }
-        return rules
+        return AndroidCosmeticNavigationSnapshot(
+            mainPageURL: mainPageURL,
+            isWhitelisted: isWhitelisted,
+            rules: rules
+        )
     }
 
     // SKIP INSERT: @kotlin.jvm.Synchronized
-    fileprivate func androidDocumentStartCSS(pageURL: URL, isMainFrame: Bool) -> String {
-        let cacheKey = "\(revision)|\(isMainFrame ? "main" : "sub")|\(pageURL.absoluteString)"
-        if let cached = androidDocumentStartCSSByPage[cacheKey] {
-            return cached
-        }
-        let rules = androidCosmeticRules(for: pageURL)
-        let css = WebEngine.androidCosmeticCSS(
-            rules: rules,
-            pageURL: pageURL,
+    fileprivate func androidDocumentStartCSS(
+        snapshot: AndroidCosmeticNavigationSnapshot,
+        frameURL: URL,
+        isMainFrame: Bool
+    ) -> String {
+        WebEngine.androidCosmeticCSS(
+            rules: snapshot.rules,
+            pageURL: frameURL,
             isMainFrame: isMainFrame,
             preferredTiming: .documentStart
         ).joined(separator: "\n")
-        androidDocumentStartCSSByPage[cacheKey] = css
-        return css
     }
     #else
     fileprivate func installPreparedIOSRuleLists(
@@ -1490,9 +1607,11 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
 @MainActor public class WebEngine : WebObjectBase {
     public let configuration: WebEngineConfiguration
     public let webView: PlatformWebView
+    private let usesCompatibilityContentBlockerRuntime: Bool
     /// The prepared content-blocker runtime used by this engine, when blocking is configured.
     ///
-    /// Pass this value to another ``WebEngineConfiguration`` to reuse its prepared rules.
+    /// Pass this value to another ``WebEngineConfiguration`` to reuse its prepared rules. The
+    /// runtime keeps only a weak attachment to this engine and does not control engine lifetime.
     public private(set) var contentBlockerRuntime: WebContentBlockerRuntime?
     /// The latest content-blocker setup errors observed by this engine.
     ///
@@ -1531,6 +1650,7 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
     ///   - webView: when set, the given platform-specific web view will
     public init(configuration: WebEngineConfiguration = WebEngineConfiguration(), webView: PlatformWebView? = nil) {
         self.configuration = configuration
+        self.usesCompatibilityContentBlockerRuntime = configuration.contentBlockerRuntime == nil
         self.contentBlockerRuntime = configuration.resolvedContentBlockerRuntime()
 
         #if !SKIP
@@ -1539,9 +1659,7 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
         } else {
             self.webView = WKWebView(frame: .zero, configuration: configuration.makeBaseWebViewConfiguration())
         }
-        if case .named = configuration.profile, configuration.profile.normalizedNamedIdentifier == nil {
-            self.profileSetupError = .invalidProfileName
-        }
+        self.profileSetupError = WebProfilePolicy.validationError(for: configuration.profile)
         #else
         let suppliedAndroidWebViewClient = webView?.webViewClient
         // fall back to using the global android context if the activity context is not set in the configuration
@@ -1776,9 +1894,20 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
 
     /// Clears the platform storage owned by one session-scoped ephemeral profile.
     ///
+    /// Release every engine using `.ephemeralSession(identifier)` before calling this method.
+    /// On iOS, an engine that is still alive continues using its existing nonpersistent store even
+    /// after the identifier is released; a new engine receives a new empty store. On Android,
+    /// browsing data is deleted from the isolated profile.
+    ///
     /// Android keeps the named profile container because `ProfileStore.deleteProfile` rejects
     /// profiles loaded during the current process. `WebStorageCompat.deleteBrowsingData` removes
     /// its cookies, caches, site storage, and service workers without depending on object lifetime.
+    ///
+    /// - Parameter identifier: The same nonempty identifier passed to
+    ///   ``WebProfile/ephemeralSession(_:)``.
+    /// - Returns: `true` when a matching session store or profile existed; otherwise `false`.
+    /// - Throws: ``WebProfileError/invalidProfileName`` for an empty identifier, or
+    ///   ``WebProfileError/unsupportedOnAndroid`` when Android multi-profile support is unavailable.
     @MainActor
     @discardableResult
     public static func clearEphemeralSessionProfile(identifier: String) async throws -> Bool {
@@ -1839,18 +1968,44 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
     /// reinstalls them from the latest `iOSRuleListPaths` and `whitelistedDomains`. Subsequent
     /// page loads use the new rules.
     ///
-    /// Engines using the compatibility `contentBlockers` property own a private runtime, so this
-    /// keeps its historical single-engine behavior. Engines explicitly sharing a runtime refresh
-    /// every engine attached to that runtime.
+    /// Configurations using the compatibility `contentBlockers` property own an implicit runtime,
+    /// and this method reapplies that property's current value. Popup children can inherit the
+    /// same implicit runtime. Engines using an explicit shared runtime should normally call the
+    /// runtime's ``WebContentBlockerRuntime/reapply(configuration:reloadLiveWebViews:)`` method.
     @MainActor
     @discardableResult
     public func reapplyContentBlockers() async -> [WebContentBlockerError] {
-        guard let contentBlockerRuntime else {
+        guard let contentBlockerRuntime = contentBlockerRuntimeForReapplication() else {
             contentBlockerSetupErrors = []
             return []
         }
-        let latestConfiguration = configuration.contentBlockers ?? contentBlockerRuntime.configuration
+        let latestConfiguration: WebContentBlockerConfiguration
+        if usesCompatibilityContentBlockerRuntime {
+            latestConfiguration = configuration.contentBlockers ?? WebContentBlockerConfiguration()
+        } else {
+            latestConfiguration = contentBlockerRuntime.configuration
+        }
         return await contentBlockerRuntime.reapply(configuration: latestConfiguration)
+    }
+
+    private func contentBlockerRuntimeForReapplication() -> WebContentBlockerRuntime? {
+        if let contentBlockerRuntime {
+            return contentBlockerRuntime
+        }
+        guard usesCompatibilityContentBlockerRuntime,
+              configuration.contentBlockerRuntime == nil,
+              configuration.contentBlockers != nil,
+              let contentBlockerRuntime = configuration.resolvedContentBlockerRuntime() else {
+            return nil
+        }
+
+        self.contentBlockerRuntime = contentBlockerRuntime
+        contentBlockerRuntime.attach(self)
+        #if SKIP
+        androidContentBlockerController.runtime = contentBlockerRuntime
+        installAndroidContentBlockerBootstrapIfNeeded()
+        #endif
+        return contentBlockerRuntime
     }
 
     fileprivate func contentBlockerRuntimeDidReapply(
@@ -1901,7 +2056,10 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
             return
         }
 
-        let bridge = AndroidContentBlockerScriptBridge(runtime: contentBlockerRuntime)
+        androidContentBlockerController.runtime = contentBlockerRuntime
+        let bridge = AndroidContentBlockerScriptBridge(
+            controller: androidContentBlockerController
+        )
         androidContentBlockerScriptBridge = bridge
         webView.addJavascriptInterface(bridge, "skipWebContentBlocker")
 
@@ -2074,7 +2232,7 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
                 AndroidProfileResources(
                     cookieManager: profile.getCookieManager(),
                     webStorage: profile.getWebStorage(),
-                    resolvedProfile: .named(profileName)
+                    resolvedProfile: .ephemeralSession(identifier)
                 )
             )
         case .named:
@@ -2132,7 +2290,7 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
     }
 
     private static func androidEphemeralSessionProfileName(for identifier: String) -> String {
-        "skipweb-ephemeral-session-\(identifier)"
+        AndroidWebProfileNamespace.ephemeralSessionProfileName(identifier: identifier)
     }
 
     private static func applyAndroidProfile(_ identifier: String, to webView: PlatformWebView) -> Bool {
@@ -3677,8 +3835,10 @@ fileprivate struct AndroidDocumentStartRuleBatch {
 
 final class AndroidContentBlockerController {
     let config: WebEngineConfiguration
-    let runtime: WebContentBlockerRuntime?
+    var runtime: WebContentBlockerRuntime?
     private var preparedPageURL: String?
+    private var navigationSnapshot: AndroidCosmeticNavigationSnapshot?
+    private var pendingMainDocumentSnapshotURL: URL?
     private var lifecycleCSS: [String] = []
     private let documentStartStyleID = "__skipweb_content_blockers_document_start"
     private let lifecycleStyleID = "__skipweb_content_blockers_lifecycle"
@@ -3688,15 +3848,24 @@ final class AndroidContentBlockerController {
         self.runtime = runtime
     }
 
+    // SKIP INSERT: @kotlin.jvm.Synchronized
+    private func beginNavigation(mainPageURL: URL) {
+        navigationSnapshot = runtime?.androidNavigationSnapshot(for: mainPageURL)
+    }
+
+    // SKIP INSERT: @kotlin.jvm.Synchronized
     func prepare(for pageURL: URL, in view: PlatformWebView) {
         let startedAt = currentMilliseconds()
         runtime?.prepareAndroidSnapshotIfNeeded()
+        beginNavigation(mainPageURL: pageURL)
+        pendingMainDocumentSnapshotURL = pageURL
         prepareCSS(for: pageURL)
         logger.info(
             "Android blocker prepare url=\(pageURL.absoluteString) totalMs=\(formatMilliseconds(currentMilliseconds() - startedAt)) bootstrapHandlers=\(runtime == nil ? 0 : 1) ruleBatchHandlers=0"
         )
     }
 
+    // SKIP INSERT: @kotlin.jvm.Synchronized
     func recoverIfNeeded(for url: String, in view: PlatformWebView) {
         guard preparedPageURL != url else { return }
         guard let pageURL = URL(string: url) else {
@@ -3709,6 +3878,10 @@ final class AndroidContentBlockerController {
         if preparedPageURL != nil {
             logger.info("Refreshing Android cosmetic CSS for redirected or history URL \(url)")
         }
+        if navigationSnapshot?.mainPageURL != pageURL {
+            beginNavigation(mainPageURL: pageURL)
+            pendingMainDocumentSnapshotURL = pageURL
+        }
         prepareCSS(for: pageURL)
         injectDocumentStartCSS(for: pageURL, into: view)
     }
@@ -3717,11 +3890,45 @@ final class AndroidContentBlockerController {
         injectCSS(lifecycleCSS, styleID: lifecycleStyleID, into: view)
     }
 
+    // SKIP INSERT: @kotlin.jvm.Synchronized
     func refreshCurrentPage(in view: PlatformWebView) {
         guard let url = view.getUrl(), let pageURL = URL(string: url) else { return }
+        beginNavigation(mainPageURL: pageURL)
+        pendingMainDocumentSnapshotURL = nil
         prepareCSS(for: pageURL)
         injectDocumentStartCSS(for: pageURL, into: view)
         injectIfNeeded(into: view)
+    }
+
+    // SKIP INSERT: @kotlin.jvm.Synchronized
+    func documentStartCSS(frameURL: URL, isMainFrame: Bool) -> String {
+        if isMainFrame {
+            if pendingMainDocumentSnapshotURL == frameURL,
+               navigationSnapshot?.mainPageURL == frameURL {
+                pendingMainDocumentSnapshotURL = nil
+            } else {
+                beginNavigation(mainPageURL: frameURL)
+                pendingMainDocumentSnapshotURL = nil
+            }
+        }
+        return currentDocumentStartCSS(
+            frameURL: frameURL,
+            isMainFrame: isMainFrame
+        )
+    }
+
+    private func currentDocumentStartCSS(
+        frameURL: URL,
+        isMainFrame: Bool
+    ) -> String {
+        guard let navigationSnapshot else {
+            return ""
+        }
+        return runtime?.androidDocumentStartCSS(
+            snapshot: navigationSnapshot,
+            frameURL: frameURL,
+            isMainFrame: isMainFrame
+        ) ?? ""
     }
 
     func intercept(_ request: android.webkit.WebResourceRequest) -> android.webkit.WebResourceResponse? {
@@ -3754,7 +3961,10 @@ final class AndroidContentBlockerController {
     }
 
     private func prepareCSS(for pageURL: URL) {
-        let rules = runtime?.androidCosmeticRules(for: pageURL) ?? []
+        if navigationSnapshot?.mainPageURL != pageURL {
+            beginNavigation(mainPageURL: pageURL)
+        }
+        let rules = navigationSnapshot?.rules ?? []
         lifecycleCSS = WebEngine.androidCosmeticCSS(
             rules: rules,
             pageURL: pageURL,
@@ -3773,7 +3983,7 @@ final class AndroidContentBlockerController {
     }
 
     private func injectDocumentStartCSS(for pageURL: URL, into view: PlatformWebView) {
-        let css = runtime?.androidDocumentStartCSS(pageURL: pageURL, isMainFrame: true) ?? ""
+        let css = currentDocumentStartCSS(frameURL: pageURL, isMainFrame: true)
         injectCSS(css.isEmpty ? [] : [css], styleID: documentStartStyleID, into: view)
     }
 
@@ -3804,16 +4014,19 @@ final class AndroidContentBlockerController {
 }
 
 final class AndroidContentBlockerScriptBridge {
-    let runtime: WebContentBlockerRuntime
+    let controller: AndroidContentBlockerController
 
-    init(runtime: WebContentBlockerRuntime) {
-        self.runtime = runtime
+    init(controller: AndroidContentBlockerController) {
+        self.controller = controller
     }
 
     // SKIP INSERT: @android.webkit.JavascriptInterface
     public func cssForPage(_ url: String, isMainFrame: Bool) -> String {
-        guard let pageURL = URL(string: url) else { return "" }
-        return runtime.androidDocumentStartCSS(pageURL: pageURL, isMainFrame: isMainFrame)
+        guard let frameURL = URL(string: url) else { return "" }
+        return controller.documentStartCSS(
+            frameURL: frameURL,
+            isMainFrame: isMainFrame
+        )
     }
 }
 
@@ -4149,6 +4362,19 @@ public class WebEngineDelegate : WebObjectBase, WKNavigationDelegate {
     func webView(_ webView: PlatformWebView, decidePolicyFor navigationResponse: NavigationResponse) async -> NavigationResponsePolicy
     func consumePageLoadPolicyCancellationSuppression() -> Bool
 }
+
+extension WebEngineConfigurationNavigationDelegate: PageLoadNavigationForwarding {
+    func webView(
+        _ webView: PlatformWebView,
+        decidePolicyFor navigationResponse: NavigationResponse
+    ) async -> NavigationResponsePolicy {
+        .allow
+    }
+
+    func consumePageLoadPolicyCancellationSuppression() -> Bool {
+        false
+    }
+}
 #endif
 
 /// A temporary NavigationDelegate that uses a callback to integrate with checked continuations
@@ -4335,6 +4561,10 @@ public extension WebKitCreateWindowParams {
     /// Using this helper preserves WebKit's popup contract and avoids
     /// NSInternalInconsistencyException ("Returned WKWebView was not created with
     /// the given configuration.") caused by configuration mismatches.
+    ///
+    /// By default the child mirrors the parent profile, scripts, message handlers, configuration
+    /// delegates, and resolved content-blocker runtime. Pass `webEngineConfiguration` only when
+    /// the child should intentionally use different application-level settings.
     @MainActor func makeChildWebEngine(
         configuration webEngineConfiguration: WebEngineConfiguration? = nil,
         frame: CGRect = .zero,
@@ -4435,6 +4665,11 @@ public struct AndroidCreateWindowParams {
     public let resultMessage: android.os.Message
     fileprivate let parentConfigurationSnapshot: WebEngineConfiguration
 
+    /// Creates Android popup callback context.
+    ///
+    /// App code normally receives this value from ``SkipWebUIDelegate`` instead of constructing
+    /// it directly. `parentConfigurationSnapshot` supplies the defaults used by
+    /// ``makeChildWebEngine(configuration:)``.
     public init(
         isDialog: Bool,
         isUserGesture: Bool,
@@ -4447,10 +4682,11 @@ public struct AndroidCreateWindowParams {
         self.parentConfigurationSnapshot = parentConfigurationSnapshot
     }
 
-    /// Creates a popup child that inherits the parent's profile and prepared blocker runtime.
+    /// Creates a popup child that mirrors the parent's application-level configuration.
     ///
-    /// Supply a configuration only to override parent settings. Its explicit blocker runtime is
-    /// preserved; otherwise the parent's resolved runtime is inherited.
+    /// By default the child inherits the parent's profile, scripts, message handlers,
+    /// configuration delegates, and resolved content-blocker runtime. Supply a configuration only
+    /// to override parent settings. An explicit blocker runtime on that configuration is preserved.
     @MainActor public func makeChildWebEngine(
         configuration: WebEngineConfiguration? = nil
     ) -> WebEngine {
@@ -4564,8 +4800,18 @@ public struct WebContextMenuAction {
     /// action mode on Android).
     public var linkContextMenuActions: ((URL) -> [WebContextMenuAction])? = nil
     public var uiDelegate: (any SkipWebUIDelegate)?
+    /// Receives main-frame navigation decisions and lifecycle events on the main actor.
+    ///
+    /// On Android this is the engine's application navigation delegate. On Apple platforms it is
+    /// installed while an engine is detached, so it can observe the first navigation of a popup
+    /// before that engine is mounted in a ``WebView``. A mounted Apple `WebView` uses its
+    /// coordinator, state, and initializer callbacks instead.
     public var navigationDelegate: (any SkipWebNavigationDelegate)?
-    /// Optional content-blocker configuration applied to web views created from this configuration.
+    /// Optional content-blocker configuration applied to engines created from this configuration.
+    ///
+    /// This compatibility property creates an implicit runtime. After changing the value, call
+    /// ``WebEngine/reapplyContentBlockers()`` on an existing engine. Setting it to `nil` and
+    /// reapplying removes the engine's installed rules.
     public var contentBlockers: WebContentBlockerConfiguration? {
         didSet {
             if contentBlockerRuntime == nil {
@@ -4576,7 +4822,9 @@ public struct WebContextMenuAction {
     /// Optional prepared content-blocker runtime shared by web views created from this configuration.
     ///
     /// When set, this runtime takes precedence over ``contentBlockers``. Reuse the same runtime to
-    /// avoid rule-dependent registration work in independently created web views.
+    /// avoid rule-dependent registration work in independently created web views. Call
+    /// ``WebContentBlockerRuntime/reapply(configuration:reloadLiveWebViews:)`` to replace its rules
+    /// and update every live engine attached to it.
     public var contentBlockerRuntime: WebContentBlockerRuntime?
     private var implicitContentBlockerRuntime: WebContentBlockerRuntime?
     /// Enables the built-in page-world console bridge that forwards page `console.*` calls to native logs.
@@ -4666,6 +4914,10 @@ public struct WebContextMenuAction {
         scriptMessageHandlerNameSet.union(legacyMessageHandlers.keys)
     }
 
+    /// Creates a popup-child configuration that mirrors this configuration.
+    ///
+    /// The returned configuration shares this configuration's resolved content-blocker runtime,
+    /// so popup children reuse prepared rules and receive later runtime reapplications.
     @MainActor
     public func popupChildMirroredConfiguration() -> WebEngineConfiguration {
         let copy = WebEngineConfiguration(
@@ -4834,7 +5086,7 @@ public struct WebContextMenuAction {
 }
 
 #if !SKIP
-fileprivate struct PreparedContentBlockerRuleLists {
+struct PreparedContentBlockerRuleLists {
     let ruleLists: [WKContentRuleList]
     let errors: [WebContentBlockerError]
 }

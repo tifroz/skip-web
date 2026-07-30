@@ -81,8 +81,9 @@ public struct WebContentBlockerConfiguration {
 ```
 
 ```swift
-public final class WebEngineConfiguration {
+public class WebEngineConfiguration {
     public var contentBlockers: WebContentBlockerConfiguration?
+    public var contentBlockerRuntime: WebContentBlockerRuntime?
     public private(set) var contentBlockerSetupErrors: [WebContentBlockerError]
 
     @MainActor public static func iOSClearContentBlockerCache() throws
@@ -92,12 +93,53 @@ public final class WebEngineConfiguration {
 ```
 
 ```swift
-public final class WebEngine {
+public class WebEngine {
+    public private(set) var contentBlockerRuntime: WebContentBlockerRuntime?
     public private(set) var contentBlockerSetupErrors: [WebContentBlockerError]
 
     public func awaitContentBlockerSetup() async -> [WebContentBlockerError]
+    @MainActor public func reapplyContentBlockers() async -> [WebContentBlockerError]
 }
 ```
+
+## Sharing Prepared Rules Across Web Views
+
+`contentBlockers` remains the simple compatibility API. A configuration using that property
+creates an implicit runtime. After changing `contentBlockers` on an existing engine, call
+`reapplyContentBlockers()`; setting the property to `nil` and reapplying removes installed rules.
+
+Use an explicit `WebContentBlockerRuntime` when independently created engines or tabs should share
+one prepared rule snapshot:
+
+```swift
+@MainActor public final class WebContentBlockerRuntime {
+    public private(set) var configuration: WebContentBlockerConfiguration
+    public private(set) var revision: Int
+
+    public init(configuration: WebContentBlockerConfiguration)
+    public func prepare() async -> [WebContentBlockerError]
+    public func reapply(
+        configuration: WebContentBlockerConfiguration,
+        reloadLiveWebViews: Bool = false
+    ) async -> [WebContentBlockerError]
+}
+```
+
+```swift
+let runtime = WebContentBlockerRuntime(configuration: blockers)
+_ = await runtime.prepare()
+
+let firstConfiguration = WebEngineConfiguration(contentBlockerRuntime: runtime)
+let secondConfiguration = WebEngineConfiguration(contentBlockerRuntime: runtime)
+```
+
+The runtime is also shared with popup children created through
+`PlatformCreateWindowContext.makeChildWebEngine()`. Calling `reapply` replaces the complete
+configuration and updates every live engine attached to the runtime. The runtime tracks engines
+weakly, so it does not keep web views alive.
+
+With `reloadLiveWebViews: false`, new request rules apply to later loads; Android cosmetic rules
+are also refreshed on the current page. Use `true` when every attached current page must reload.
 
 ## Android Content Blocking
 
@@ -229,16 +271,24 @@ AndroidCosmeticRule(
 ```
 
 Think of that rule as:
-- register this document-start script only for `https://*.doubleclick.net`
-- then, inside those matching subframes, only apply the CSS when the current frame URL also matches `.*\\/ad-frame\\.html`
+- expose the fixed document-start blocker hook to the frame
+- return CSS only when the frame origin matches `https://*.doubleclick.net`
+- apply the CSS only when the current frame URL also matches `.*\\/ad-frame\\.html`
 
-`allowedOriginRules` is the registration-time scope. Android's `WebViewCompat.addDocumentStartJavaScript(...)` requires those origin rules up front, so SkipWeb cannot infer them later inside the script. `urlFilterPattern`, `ifDomainList`, and `unlessDomainList` are the runtime frame guards checked by the injected script after it has been installed.
+When Android document-start scripts are supported, SkipWeb installs one fixed hook per web view.
+The shared runtime evaluates `allowedOriginRules`, `urlFilterPattern`, `ifDomainList`,
+`unlessDomainList`, and `frameScope` against the current frame before returning CSS. Rule count no
+longer determines the number of document-start registrations. Older runtimes use lifecycle
+injection as a fallback.
 
 Think of Android cosmetics as two buckets:
-- `persistentCosmeticRules`: a long-lived baseline registered once per `WebView` and reused across navigations when it does not change
-- `navigationCosmeticRules(for:)`: page-specific CSS that is refreshed for each main-frame navigation when needed
+- `persistentCosmeticRules`: a long-lived baseline captured by the runtime revision
+- `navigationCosmeticRules(for:)`: page-specific CSS evaluated for the current page
 
-This split is mainly about avoiding repeated work. Think of it as "install the baseline once, then only swap the delta when the page changes." Rules that are effectively global to the browsing session belong in `persistentCosmeticRules`; rules that depend on the current page URL, host, or dynamic match context belong in `navigationCosmeticRules(for:)`.
+This split is mainly about avoiding repeated work. Rules that are effectively global to the
+browsing session belong in `persistentCosmeticRules`; rules that depend on the current page URL,
+host, or dynamic match context belong in `navigationCosmeticRules(for:)`. Call runtime `reapply`
+after changing the persistent baseline.
 
 Whitelist opt-out is enforced inside `SkipWeb`'s Android controller. If the current main-frame URL matches `whitelistedDomains`, neither the persistent baseline nor the per-navigation delta is applied.
 

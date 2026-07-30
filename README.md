@@ -96,7 +96,9 @@ let config = WebEngineConfiguration(
     schemeHandlers: [:],
     uiDelegate: nil,
     navigationDelegate: nil,
-    contentBlockers: nil
+    contentBlockers: nil,
+    capturesConsoleOutput: true,
+    contentBlockerRuntime: nil
 )
 ```
 
@@ -130,6 +132,30 @@ On iOS this uses `WKWebsiteDataStore.nonPersistent()`. On Android this requires 
 `WebViewFeature.MULTI_PROFILE`; SkipWeb creates a generated named profile for the engine so
 cookies and storage do not share the default WebView store.
 
+On Android, `.named(...)` identifiers beginning with `skipweb-internal-` are reserved for
+SkipWeb-owned profiles and fail with `WebProfileError.invalidProfileName`.
+
+Use `.ephemeralSession(id)` when multiple web views should share one explicitly owned,
+nonpersistent login or browsing session:
+
+```swift
+let sessionID = UUID().uuidString
+let config = WebEngineConfiguration(
+    profile: .ephemeralSession(sessionID)
+)
+```
+
+Engines with the same session ID share cookies and website data. Release all engines using the
+session, then clear its platform storage when the session ends. The ID must not be empty.
+
+```swift
+_ = try await WebEngine.clearEphemeralSessionProfile(identifier: sessionID)
+```
+
+On iOS, clearing releases SkipWeb's reference to the shared nonpersistent data store; any engine
+that is still alive continues using its old store. On Android, clearing deletes browsing data in
+the isolated profile. Android requires `WebViewFeature.MULTI_PROFILE`.
+
 `WebViewNavigator` can keep a warm `WebEngine` and reuse it across view recreation.
 When the same navigator is rebound to an engine that already has content/history, `initialURL`/`initialHTML` are not reloaded.
 This lets apps preserve page state when navigating away and back with the same navigator instance.
@@ -154,9 +180,18 @@ WebView(
 Use a stable per-tab identifier when engine identity should be tied to a tab ID instead of only
 to a `WebViewNavigator` instance. A stable navigator can still preserve one warm engine across
 view recreation; `persistentWebViewID` is for managing multiple live engines by explicit tab ID.
+IDs share one process-wide namespace, so make them unique per logical tab. Reusing an ID returns
+the first cached engine with its original configuration until that ID is removed.
 
-`SkipWeb` only provides the reuse and eviction primitives. The host browser feature should decide how many
-tab engines stay warm, when engines are created lazily, and when to purge them.
+**Important:** passing a non-`nil` `persistentWebViewID` opts into explicit lifetime management.
+SkipWeb stores the engine in a process-wide cache that holds a strong reference. Removing the
+`WebView` from the UI does not release that engine. SkipWeb does not automatically limit the cache,
+evict old entries, or purge entries during memory pressure. Every distinct retained ID can keep a
+native web view, page state, history, and related browser resources in memory.
+
+The host browser must decide how many tab engines stay warm, when engines are created lazily, and
+when to purge them. Call removal after the corresponding view has been unmounted; on Android,
+removal destroys the cached native web view.
 
 When a tab closes or a background tab should no longer keep its engine alive, remove it explicitly:
 
@@ -169,6 +204,11 @@ For bulk purges, such as memory pressure or session changes, use:
 ```swift
 WebView.removePersistentWebViews(ids: tabIDs.map(\.uuidString))
 ```
+
+Removal drops SkipWeb's cache reference and ensures the next mount for that ID creates a new
+engine. It cannot force immediate deallocation if a `WebViewNavigator`, mounted view, or other
+application object still holds the engine. Release those references as part of eviction; on
+Android, they must not be used after removal because the cached native web view is destroyed.
 
 Content blockers are also configured on `WebEngineConfiguration`:
 
@@ -192,6 +232,38 @@ let config = WebEngineConfiguration(
 _ = await config.iOSPrepareContentBlockers()
 ```
 
+For multiple independently created web views, create one `WebContentBlockerRuntime` and pass it to
+each configuration. The runtime prepares one rule snapshot, is inherited by popup children, and
+keeps only weak references to attached engines:
+
+```swift
+let runtime = WebContentBlockerRuntime(
+    configuration: WebContentBlockerConfiguration(
+        iOSRuleListPaths: ruleListPaths,
+        androidMode: .custom(MyAndroidContentBlockingProvider())
+    )
+)
+
+_ = await runtime.prepare()
+
+let config = WebEngineConfiguration(
+    contentBlockerRuntime: runtime
+)
+```
+
+When the rules change, replace the complete runtime configuration once. Every live engine using
+that runtime is updated; pass `reloadLiveWebViews: true` when current pages must reload:
+
+```swift
+let errors = await runtime.reapply(
+    configuration: updatedBlockers,
+    reloadLiveWebViews: true
+)
+```
+
+The older `contentBlockers` property remains the simpler single-configuration API. After changing
+it on an existing engine—including setting it to `nil`—call `engine.reapplyContentBlockers()`.
+
 On Android, `AndroidCosmeticRule` can now carry current-frame guards directly:
 
 ```swift
@@ -204,10 +276,19 @@ AndroidCosmeticRule(
 )
 ```
 
-Think of it as "return selectors, render CSS once at the edge". `SkipWeb` installs the rule at document start for all frames, then the injected script checks the frame's own URL and host before turning the matching selectors into `display: none !important`. That is what makes subframe cosmetic blocking work on Android without needing a second late injection path.
+Think of it as "return selectors, render CSS once at the edge". On supported Android runtimes,
+SkipWeb installs one fixed document-start hook, checks each frame's URL and host in the shared
+runtime, and returns only matching `display: none !important` CSS. Older runtimes use lifecycle
+injection as a fallback.
 
 For Android navigation callbacks, prefer `WebEngineConfiguration.navigationDelegate`.
 `WebEngine.engineDelegate` remains available as a deprecated compatibility escape hatch, but SkipWeb now keeps blocker enforcement on an internal engine-owned `WebViewClient`.
+
+`SkipWebNavigationDelegate` runs on the main actor. Its
+`webEngineDidStartProvisionalNavigation(_:)` callback exposes the first concrete URL of a
+main-frame navigation. On Apple platforms, the configuration delegate is active while an engine
+is detached, which lets it classify a popup engine that has been created but not mounted yet.
+After an Apple engine is mounted in `WebView`, use the view's state and initializer callbacks.
 
 For example, you can use `shouldOverrideURLLoading` to hand `mailto:` links or app deep links to native code before the `WebView` navigates:
 
@@ -228,6 +309,19 @@ final class AppNavigationDelegate: SkipWebNavigationDelegate {
 
 let config = WebEngineConfiguration()
 config.navigationDelegate = AppNavigationDelegate()
+```
+
+For view-local interception, the `WebView` initializer closure now also reports whether the
+request targets the main frame:
+
+```swift
+WebView(
+    shouldOverrideUrlLoading: { url, isMainFrame in
+        guard isMainFrame, url.scheme == "myapp" else { return false }
+        routeIntoNativeScreen(url)
+        return true
+    }
+)
 ```
 
 Navigation APIs:
@@ -521,11 +615,13 @@ SkipWeb validates this contract at popup creation time:
 - A warning is logged when verification cannot be performed.
 - An error is logged when a contract violation is detected.
 
-For iOS parity, return a child created with `platformContext.makeChildWebEngine(...)`.
-By default this mirrors the parent `WebEngineConfiguration` and inspectability on the popup child. Pass an explicit configuration only when you intentionally want the child to diverge.
+On both platforms, prefer returning a child created with `platformContext.makeChildWebEngine(...)`.
+By default this mirrors the parent `WebEngineConfiguration`, including its profile and resolved
+content-blocker runtime. On iOS it also preserves WebKit's required configuration identity and
+mirrors inspectability. Pass an explicit configuration only when you intentionally want the child to diverge.
 This default mirroring is configuration-level. Platform delegate assignments on the returned child (`WKUIDelegate`, `WKNavigationDelegate`) are not automatically copied from the parent, so assign them explicitly if your app depends on that behavior.
-Mirrored popup configuration also carries over `contentBlockers`, so children created with `makeChildWebEngine(...)` inherit the parent's blocker setup.
-On Android, once a child is returned from the delegate, SkipWeb mirrors key parent web settings and inherits the parent `WebProfile` onto the child; if profile inheritance fails, popup creation is denied.
+Popup children sharing the parent's runtime reuse prepared rules and receive later runtime reapplications.
+On Android, once a child is returned from the delegate, SkipWeb also mirrors key parent web settings and verifies parent `WebProfile` inheritance; if profile inheritance fails, popup creation is denied.
 
 ### Scroll Delegate
 
@@ -855,13 +951,16 @@ Platform behavior:
 | `.default` | `WKWebsiteDataStore.default()` | Default process-wide store |
 | `.named("id")` | `WKWebsiteDataStore(forIdentifier: "id")` | AndroidX WebKit named profile (requires `WebViewFeature.MULTI_PROFILE`) |
 | `.ephemeral` | `WKWebsiteDataStore.nonPersistent()` | Generated AndroidX WebKit named profile (requires `WebViewFeature.MULTI_PROFILE`) |
+| `.ephemeralSession("id")` | Shared `WKWebsiteDataStore.nonPersistent()` for that session ID | Shared AndroidX WebKit named profile for that session ID (requires `WebViewFeature.MULTI_PROFILE`) |
 
 - iOS cookie scope follows the `WKWebsiteDataStore` attached to the `WKWebView`.
 - Android `.default` uses `android.webkit.CookieManager` singleton.
 - Android `.named("id")` requires `WebViewFeature.MULTI_PROFILE`; otherwise profile setup fails with `WebProfileError.unsupportedOnAndroid` (no fallback to default).
+- Android `.named("id")` rejects the reserved `skipweb-internal-` prefix with `WebProfileError.invalidProfileName`.
 - Android `.ephemeral` also requires `WebViewFeature.MULTI_PROFILE`; otherwise profile setup fails with `WebProfileError.unsupportedOnAndroid` instead of falling back to the default store.
 - Each Android `.ephemeral` engine receives a generated named profile. Popup child engines inherit the parent's resolved generated profile so opener and child share the same isolated store.
-- On Android, always check profile support at runtime before using `.named("id")` or `.ephemeral` profiles. You can use `WebEngine.isAndroidMultiProfileSupported()` (or the underlying `WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)` check directly).
+- Android `.ephemeralSession("id")` shares one generated named profile across engines using the same ID. Release those engines and call `WebEngine.clearEphemeralSessionProfile(identifier:)` to delete its browsing data.
+- On Android, always check profile support at runtime before using `.named("id")`, `.ephemeral`, or `.ephemeralSession("id")`. You can use `WebEngine.isAndroidMultiProfileSupported()` (or the underlying `WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)` check directly).
 - `cookies(for:)` returns URL-matching cookies; on Android this is best-effort because `CookieManager` reads as a cookie-header string (limited metadata).
 - `setCookie(_:requestURL:)` requires either `cookie.domain` or a `requestURL` host; otherwise it throws `WebCookieError.missingCookieDomain`.
 - `removeData(ofTypes:modifiedSince:)` maps to iOS `WKWebsiteDataStore.removeData`.

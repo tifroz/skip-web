@@ -43,7 +43,7 @@ The example below is inspired by the sandbox experiment and demonstrates:
 - a direct `SkipWebUIDelegate` implementation
 - allowing popup creation by returning a child engine
 - optional callback hooks for host UI/logging
-- platform-safe child engine construction with `PlatformWebView`, an alias for `WkWebView` (iOS) and `WebView` (Android)
+- platform-safe child engine construction through `PlatformCreateWindowContext`
 
 ```swift
 import Foundation
@@ -75,16 +75,9 @@ public final class PopupDelegateProbe: NSObject, SkipWebUIDelegate {
     }
 
     private static func makeChildEngine(platformContext: PlatformCreateWindowContext) -> WebEngine {
-        #if os(Android)
         return MainActor.assumeIsolated {
-            WebEngine(configuration: WebEngineConfiguration())
+            platformContext.makeChildWebEngine()
         }
-        #else
-        return MainActor.assumeIsolated {
-            let child = platformContext.makeChildWebEngine()
-            return child
-        }
-        #endif
     }
 }
 ```
@@ -128,9 +121,10 @@ struct PopupHostView: View {
 - Keep the delegate class shape simple and direct.
 - On iOS, WebKit requires the returned child to be initialized with the exact configuration supplied to `WKUIDelegate.createWebViewWith`.
 - If this contract is violated, WebKit can raise `NSInternalInconsistencyException` with: `Returned WKWebView was not created with the given configuration.`
-- For iOS popup creation, return a child created via `platformContext.makeChildWebEngine(...)`.
-- `makeChildWebEngine()` mirrors the parent `WebEngineConfiguration` and inspectability by default. Pass an explicit configuration only when you intentionally want different child behavior.
-- Mirrored popup configuration includes `contentBlockers`, so child engines created this way inherit the parent's blocker setup.
+- On both platforms, prefer returning a child created via `platformContext.makeChildWebEngine(...)`.
+- `makeChildWebEngine()` mirrors the parent `WebEngineConfiguration` by default, including its profile and resolved content-blocker runtime. On iOS it also preserves WebKit's required configuration identity and mirrors inspectability.
+- Pass an explicit configuration only when you intentionally want different child behavior. An explicit content-blocker runtime on that configuration is preserved.
+- Because popup children share the parent's resolved content-blocker runtime by default, later runtime reapplications update the child too.
 - `makeChildWebEngine()` does not automatically copy platform delegate assignments (`WKUIDelegate`, `WKNavigationDelegate`) from the parent web view; assign those explicitly when needed.
-- On Android, after your delegate returns a child `WebEngine`, SkipWeb mirrors key parent web settings and inherits the parent `WebProfile` onto that child; if profile inheritance fails, popup creation is denied.
+- On Android, after your delegate returns a child `WebEngine`, SkipWeb also mirrors key parent web settings and verifies parent `WebProfile` inheritance; if profile inheritance fails, popup creation is denied.
 - `PlatformCreateWindowContext` aliases `WebKitCreateWindowParams` on iOS and `AndroidCreateWindowParams` on Android.
