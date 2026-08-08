@@ -60,6 +60,11 @@ public final class WebScrollViewProxy: Equatable {
     public internal(set) var contentOffset: WebScrollPoint
     public internal(set) var contentSize: WebScrollSize
     public internal(set) var visibleSize: WebScrollSize
+    /// Content-offset velocity captured at the latest drag end, in offset units per second.
+    ///
+    /// Positive components point toward increasing `contentOffset` values. The value is
+    /// reset to zero when a new drag begins.
+    public internal(set) var dragEndContentVelocity: WebScrollPoint
     public internal(set) var isTracking: Bool
     public internal(set) var isDragging: Bool
     public internal(set) var isDecelerating: Bool
@@ -68,6 +73,7 @@ public final class WebScrollViewProxy: Equatable {
     public init(contentOffset: WebScrollPoint = WebScrollPoint(),
                 contentSize: WebScrollSize = WebScrollSize(),
                 visibleSize: WebScrollSize = WebScrollSize(),
+                dragEndContentVelocity: WebScrollPoint = WebScrollPoint(),
                 isTracking: Bool = false,
                 isDragging: Bool = false,
                 isDecelerating: Bool = false,
@@ -75,6 +81,7 @@ public final class WebScrollViewProxy: Equatable {
         self.contentOffset = contentOffset
         self.contentSize = contentSize
         self.visibleSize = visibleSize
+        self.dragEndContentVelocity = dragEndContentVelocity
         self.isTracking = isTracking
         self.isDragging = isDragging
         self.isDecelerating = isDecelerating

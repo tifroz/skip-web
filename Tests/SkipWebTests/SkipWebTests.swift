@@ -329,6 +329,15 @@ final class SkipWebTests: XCTestCase {
     }
 
     @MainActor
+    func testWebScrollViewProxyCarriesDragEndContentVelocity() {
+        let proxy = WebScrollViewProxy(
+            dragEndContentVelocity: WebScrollPoint(x: -300, y: 1_200)
+        )
+
+        XCTAssertEqual(proxy.dragEndContentVelocity, WebScrollPoint(x: -300, y: 1_200))
+    }
+
+    @MainActor
     func testNoOpScrollDelegateDefaults() {
         let delegate = NoOpScrollDelegate()
         let proxy = WebScrollViewProxy()
@@ -365,6 +374,12 @@ final class SkipWebTests: XCTestCase {
 
         scrollView.forcedTracking = false
         scrollView.forcedDragging = false
+        var targetContentOffset = CGPoint(x: 0, y: 120)
+        coordinator.scrollViewWillEndDragging(
+            scrollView,
+            withVelocity: CGPoint(x: -0.25, y: 1.5),
+            targetContentOffset: &targetContentOffset
+        )
         coordinator.scrollViewDidEndDragging(scrollView, willDecelerate: true)
 
         scrollView.forcedDecelerating = true
@@ -381,6 +396,10 @@ final class SkipWebTests: XCTestCase {
         XCTAssertEqual(coordinator.scrollViewProxy.contentOffset.y, 40)
         XCTAssertEqual(coordinator.scrollViewProxy.visibleSize.height, 200)
         XCTAssertEqual(coordinator.scrollViewProxy.contentSize.height, 600)
+        XCTAssertEqual(
+            coordinator.scrollViewProxy.dragEndContentVelocity,
+            WebScrollPoint(x: -250, y: 1_500)
+        )
         XCTAssertTrue(coordinator.state.scrollingDown)
     }
 
@@ -455,6 +474,10 @@ final class SkipWebTests: XCTestCase {
         tracker.handleTouchEnd(velocity: CGPoint(x: 0, y: 10))
 
         XCTAssertEqual(delegate.events, ["willBeginDragging", "didScroll", "didEndDragging:false"])
+        XCTAssertEqual(
+            coordinator.scrollViewProxy.dragEndContentVelocity,
+            WebScrollPoint(x: 0, y: -10)
+        )
         XCTAssertTrue(coordinator.state.scrollingDown)
 
         delegate.events.removeAll()

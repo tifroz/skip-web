@@ -62,6 +62,7 @@ public final class WebScrollViewProxy: Equatable {
     public internal(set) var contentOffset: WebScrollPoint
     public internal(set) var contentSize: WebScrollSize
     public internal(set) var visibleSize: WebScrollSize
+    public internal(set) var dragEndContentVelocity: WebScrollPoint
     public internal(set) var isTracking: Bool
     public internal(set) var isDragging: Bool
     public internal(set) var isDecelerating: Bool
@@ -73,6 +74,10 @@ Portable geometry is expressed through:
 
 - `WebScrollPoint(x:y:)`
 - `WebScrollSize(width:height:)`
+
+`dragEndContentVelocity` is normalized to content-offset units per second. Positive
+components point toward increasing `contentOffset` values. It resets to zero when a
+new drag begins and is populated before `scrollViewDidEndDragging`.
 
 ## Platform Mapping
 

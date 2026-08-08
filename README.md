@@ -670,6 +670,7 @@ Supported callbacks:
 - `contentOffset`
 - `contentSize`
 - `visibleSize`
+- `dragEndContentVelocity` (content-offset units per second, with positive values toward increasing offsets)
 - `isTracking`
 - `isDragging`
 - `isDecelerating`

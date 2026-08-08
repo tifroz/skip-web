@@ -1520,6 +1520,7 @@ final class AndroidScrollTracker {
         guard let coordinator else {
             return
         }
+        coordinator.scrollViewProxy.dragEndContentVelocity = WebScrollPoint()
         let snapshot = snapshot(from: webView)
         coordinator.updateScrollProxy(
             contentOffset: snapshot.contentOffset,
@@ -1596,6 +1597,12 @@ final class AndroidScrollTracker {
             return
         }
 
+        // Android reports pointer velocity. Negate it so the portable value follows
+        // content-offset direction, matching increasing scroll X/Y on both platforms.
+        coordinator.scrollViewProxy.dragEndContentVelocity = WebScrollPoint(
+            x: -velocity.x,
+            y: -velocity.y
+        )
         let minimumFlingVelocity = Double(
             android.view.ViewConfiguration.get(
                 attachedWebView?.getContext() ?? coordinator.config.context ?? ProcessInfo.processInfo.androidContext
@@ -2073,6 +2080,7 @@ extension WebViewCoordinator: UIScrollViewDelegate {
     }
 
     public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        scrollViewProxy.dragEndContentVelocity = WebScrollPoint()
         updateScrollProxy(
             contentOffset: scrollView.contentOffset,
             contentSize: scrollView.contentSize,
@@ -2082,6 +2090,18 @@ extension WebViewCoordinator: UIScrollViewDelegate {
             isDecelerating: scrollView.isDecelerating
         )
         publicScrollDelegate?.scrollViewWillBeginDragging(scrollViewProxy)
+    }
+
+    public func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        // UIKit reports points per millisecond in content-offset direction.
+        scrollViewProxy.dragEndContentVelocity = WebScrollPoint(
+            x: Double(velocity.x) * 1_000,
+            y: Double(velocity.y) * 1_000
+        )
     }
 
     public func scrollViewWillBeginDecelerating(_ scrollView: UIScrollView) {
