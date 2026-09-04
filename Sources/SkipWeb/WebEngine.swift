@@ -28,6 +28,17 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 #endif
 
+#if SKIP
+/// Completes one visual-state request without exposing Android callback types across the bridge.
+private struct WebEngineVisualStateCallback: android.webkit.WebView.VisualStateCallback {
+    let completion: () -> Void
+
+    override func onComplete(requestId: Int64) {
+        completion()
+    }
+}
+#endif
+
 public enum WebProfile: Equatable, Hashable, Sendable {
     /// Uses the platform default persistent website data store.
     case `default`
@@ -1878,6 +1889,36 @@ private final class WeakWebEngineScriptMessageHandler: NSObject, WKScriptMessage
     public func evaluate(js: String) async throws -> String? {
         try throwProfileSetupErrorIfNeeded()
         return try await evaluateJavaScriptAsync(js)
+    }
+
+    /// Whether the platform WebView is attached to a window, rather than merely allocated.
+    public var isAttachedToWindow: Bool {
+        #if SKIP
+        return webView.isAttachedToWindow()
+        #else
+        return webView.window != nil
+        #endif
+    }
+
+    /// Waits for Android's current DOM updates to be available to the next WebView draw.
+    ///
+    /// Call after document readiness while the WebView remains attached and visible in the
+    /// native hierarchy (an enclosing view may have zero opacity). This is a no-op on Apple
+    /// platforms, which retain their navigation-completion behavior. Callers must revalidate
+    /// their navigation/runtime identity after suspension and own any readiness timeout.
+    public func waitForPendingVisualUpdates() async {
+        #if SKIP
+        let didComplete: Bool = suspendCancellableCoroutine { continuation in
+            webView.postVisualStateCallback(0, WebEngineVisualStateCallback {
+                if continuation.isActive {
+                    continuation.resume(true)
+                }
+            })
+        }
+        if didComplete {
+            logger.debug("WebEngine visual state ready")
+        }
+        #endif
     }
 
     static func androidRemovalBuckets(for types: Set<WebSiteDataType>) -> Set<WebDataRemovalBucket> {

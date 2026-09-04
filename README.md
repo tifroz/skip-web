@@ -1009,6 +1009,16 @@ Kotlin JUnit tests in the Robolectric Android simulation environment.
 Parity testing can be performed with `skip test`,
 which will output a table of the test results for both platforms.
 
+## Revealing an attached WebView
+
+`WebEngine.isAttachedToWindow` distinguishes a mounted platform view from an
+allocated engine. After document readiness, `await engine.waitForPendingVisualUpdates()`
+waits for Android's visual-state callback before revealing an enclosing view.
+Keep the WebView attached and natively visible during this wait; an enclosing
+view may have zero opacity. The method is a no-op on Apple platforms, preserving
+their navigation-completion behavior. Callers own timeouts and must revalidate
+their navigation or runtime identity after the wait.
+
 ## Contributing
 
 We welcome contributions to this package in the form of enhancements and bug fixes.
