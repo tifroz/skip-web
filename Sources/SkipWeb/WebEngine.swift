@@ -4001,6 +4001,52 @@ final class AndroidContentBlockerController {
         return nil
     }
 
+    /// Evaluates an Android main-frame navigation with the page that initiated it as context.
+    func mainFrameNavigationDecision(
+        requestURL: URL,
+        mainDocumentURL: URL?,
+        method: String,
+        headers: [String: String],
+        hasGesture: Bool,
+        isRedirect: Bool?
+    ) -> AndroidRequestBlockDecision {
+        let scheme = requestURL.scheme?.lowercased()
+        guard scheme == "http" || scheme == "https" else {
+            return .allow
+        }
+        let request = AndroidBlockableRequest(
+            url: requestURL,
+            mainDocumentURL: mainDocumentURL,
+            method: method,
+            headers: headers,
+            isForMainFrame: true,
+            hasGesture: hasGesture,
+            isRedirect: isRedirect,
+            resourceTypeHint: .document
+        )
+        return runtime?.androidRequestDecision(for: request) ?? .allow
+    }
+
+    /// Returns whether a WebView navigation callback should cancel its main-frame load.
+    func shouldBlockMainFrameNavigation(
+        _ request: android.webkit.WebResourceRequest,
+        currentPageURL: URL?
+    ) -> Bool {
+        guard request.isForMainFrame,
+              let requestURL = URL(string: request.url.toString()) else {
+            return false
+        }
+        let headers = WebEngine.androidRequestHeaders(from: request)
+        return mainFrameNavigationDecision(
+            requestURL: requestURL,
+            mainDocumentURL: currentPageURL,
+            method: request.method,
+            headers: headers,
+            hasGesture: request.hasGesture(),
+            isRedirect: WebEngine.androidRequestIsRedirect(request)
+        ) == .block
+    }
+
     private func prepareCSS(for pageURL: URL) {
         if navigationSnapshot?.mainPageURL != pageURL {
             beginNavigation(mainPageURL: pageURL)
@@ -4286,9 +4332,24 @@ final class AndroidEngineWebViewClient : android.webkit.WebViewClient {
     }
 
     override func shouldOverrideUrlLoading(view: PlatformWebView, request: android.webkit.WebResourceRequest) -> Bool {
-        logger.log("shouldOverrideUrlLoading: \(request.url)")
+        let currentPageURL = URL(string: view.getUrl() ?? "")
+        let isRedirect = WebEngine.androidRequestIsRedirect(request)
+        logger.log(
+            "shouldOverrideUrlLoading source=\(currentPageURL?.absoluteString ?? "<nil>") target=\(request.url) mainFrame=\(request.isForMainFrame) redirect=\(String(describing: isRedirect)) gesture=\(request.hasGesture())"
+        )
         let mainFrameURL = request.isForMainFrame ? URL(string: request.url.toString()) : nil
         if let engine, let url = mainFrameURL {
+            if engine.androidContentBlockerController.shouldBlockMainFrameNavigation(
+                request,
+                currentPageURL: currentPageURL
+            ) {
+                logger.info(
+                    "Android blocker cancelled main-frame navigation source=\(currentPageURL?.absoluteString ?? "<nil>") target=\(url.absoluteString) redirect=\(String(describing: isRedirect)) gesture=\(request.hasGesture())"
+                )
+                (embeddedNavigationClient as? WebViewClient)?
+                    .contentRuleDidBlockNavigation(to: url)
+                return true
+            }
             engine.androidContentBlockerController.prepare(for: url, in: view)
         }
         if embeddedNavigationClient?.shouldOverrideUrlLoading(view, request) == true {

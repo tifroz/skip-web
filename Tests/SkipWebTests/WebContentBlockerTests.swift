@@ -62,6 +62,28 @@ final class WebContentBlockerTests: XCTestCase {
         }
     }
 
+    final class RecordingContentBlockingProvider: AndroidContentBlockingProvider {
+        let decision: AndroidRequestBlockDecision
+        var requests: [AndroidBlockableRequest] = []
+
+        init(decision: AndroidRequestBlockDecision) {
+            self.decision = decision
+        }
+
+        var persistentCosmeticRules: [AndroidCosmeticRule] {
+            []
+        }
+
+        func requestDecision(for request: AndroidBlockableRequest) -> AndroidRequestBlockDecision {
+            requests.append(request)
+            return decision
+        }
+
+        func navigationCosmeticRules(for page: AndroidPageContext) -> [AndroidCosmeticRule] {
+            []
+        }
+    }
+
     final class TestNavigationDelegate: SkipWebNavigationDelegate {
     }
 
@@ -537,6 +559,84 @@ final class WebContentBlockerTests: XCTestCase {
     }
 
     #if SKIP
+    // Verifies redirect navigation checks preserve the initiating page and Android request facts.
+    func testAndroidMainFrameNavigationDecisionUsesCurrentPageContext() throws {
+        let currentPageURL = try XCTUnwrap(URL(string: "https://primewire.mov/movie/example"))
+        let redirectURL = try XCTUnwrap(URL(string: "https://pro.roundflow.net/redirect"))
+        let provider = RecordingContentBlockingProvider(decision: .block)
+        let configuration = WebContentBlockerConfiguration(androidMode: .custom(provider))
+        let controller = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: WebContentBlockerRuntime(configuration: configuration)
+        )
+
+        let decision = controller.mainFrameNavigationDecision(
+            requestURL: redirectURL,
+            mainDocumentURL: currentPageURL,
+            method: "GET",
+            headers: ["Accept": "text/html"],
+            hasGesture: false,
+            isRedirect: true
+        )
+
+        XCTAssertEqual(decision, AndroidRequestBlockDecision.block)
+        XCTAssertEqual(
+            provider.requests,
+            [
+                AndroidBlockableRequest(
+                    url: redirectURL,
+                    mainDocumentURL: currentPageURL,
+                    method: "GET",
+                    headers: ["Accept": "text/html"],
+                    isForMainFrame: true,
+                    hasGesture: false,
+                    isRedirect: true,
+                    resourceTypeHint: .document
+                )
+            ]
+        )
+    }
+
+    // Verifies schemes outside HTTP(S) never enter the content-rule provider.
+    func testAndroidMainFrameNavigationDecisionAllowsNonHTTPURL() throws {
+        let provider = RecordingContentBlockingProvider(decision: .block)
+        let configuration = WebContentBlockerConfiguration(androidMode: .custom(provider))
+        let controller = AndroidContentBlockerController(
+            config: WebEngineConfiguration(contentBlockers: configuration),
+            runtime: WebContentBlockerRuntime(configuration: configuration)
+        )
+
+        let decision = controller.mainFrameNavigationDecision(
+            requestURL: try XCTUnwrap(URL(string: "intent://example/path")),
+            mainDocumentURL: try XCTUnwrap(URL(string: "https://primewire.mov/")),
+            method: "GET",
+            headers: [:],
+            hasGesture: true,
+            isRedirect: false
+        )
+
+        XCTAssertEqual(decision, AndroidRequestBlockDecision.allow)
+        XCTAssertTrue(provider.requests.isEmpty)
+    }
+
+    // Verifies a blocked navigation can notify the host without invoking tab lifecycle behavior.
+    func testAndroidWebViewClientReportsContentRuleNavigationBlock() throws {
+        let blockedURL = try XCTUnwrap(URL(string: "https://pro.roundflow.net/redirect"))
+        var reportedURLs: [URL] = []
+        let client = WebViewClient(
+            state: WebViewState(),
+            onNavigationCommitted: nil,
+            onNavigationFinished: nil,
+            onNavigationFailed: nil,
+            onContentRuleBlockedNavigation: { reportedURLs.append($0) },
+            shouldOverrideUrlLoadingHandler: nil
+        )
+
+        client.contentRuleDidBlockNavigation(to: blockedURL)
+
+        XCTAssertEqual(reportedURLs, [blockedURL])
+    }
+
     // Verifies a main-page rule remains selected while its frame guards are evaluated against an iframe URL.
     func testAndroidDocumentStartBridgeUsesMainPageToSelectSubframeRules() throws {
         let mainPageURL = try XCTUnwrap(URL(string: "https://publisher.example/article"))

@@ -145,6 +145,7 @@ public struct WebView : View {
     let onNavigationFinished: (() -> Void)?
     let onNavigationFailed: (() -> Void)?
     let onDownloadRequested: ((WebDownloadRequest) -> Void)?
+    let onContentRuleBlockedNavigation: ((_ url: URL) -> Void)?
     let scrollDelegate: (any SkipWebScrollDelegate)?
     let shouldOverrideUrlLoading: ((_ url: URL, _ isMainFrame: Bool) -> Bool)?
     let persistentWebViewID: String?
@@ -171,6 +172,8 @@ public struct WebView : View {
     ///   app's warm-tab pool. Each retained engine can keep a native web view, page state,
     ///   history, and related browser resources in memory.
     ///
+    /// - Parameter onContentRuleBlockedNavigation: Called on Android when a content rule
+    ///   cancels an HTTP(S) main-frame navigation before the target document loads.
     /// - Parameter shouldOverrideUrlLoading: Called with the requested URL and whether
     ///   the navigation targets the main frame. Return `true` to cancel the navigation.
     /// - Parameter persistentWebViewID: A stable cache key for explicit cross-mount engine
@@ -187,6 +190,7 @@ public struct WebView : View {
         onNavigationFinished: (() -> Void)? = nil,
         onNavigationFailed: (() -> Void)? = nil,
         onDownloadRequested: ((WebDownloadRequest) -> Void)? = nil,
+        onContentRuleBlockedNavigation: ((_ url: URL) -> Void)? = nil,
         shouldOverrideUrlLoading: ((_ url: URL, _ isMainFrame: Bool) -> Bool)? = nil,
         persistentWebViewID: String? = nil
     ) {
@@ -204,6 +208,7 @@ public struct WebView : View {
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
         self.onDownloadRequested = onDownloadRequested
+        self.onContentRuleBlockedNavigation = onContentRuleBlockedNavigation
         self.shouldOverrideUrlLoading = shouldOverrideUrlLoading
         self.persistentWebViewID = persistentWebViewID
     }
@@ -235,6 +240,7 @@ public struct WebView : View {
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
             onDownloadRequested: onDownloadRequested,
+            onContentRuleBlockedNavigation: nil,
             shouldOverrideUrlLoading: { url, _ in
                 shouldOverrideUrlLoading(url)
             },
@@ -557,7 +563,13 @@ struct WebViewClient : android.webkit.WebViewClient {
     let onNavigationCommitted: (() -> Void)?
     let onNavigationFinished: (() -> Void)?
     let onNavigationFailed: (() -> Void)?
+    let onContentRuleBlockedNavigation: ((_ url: URL) -> Void)?
     let shouldOverrideUrlLoadingHandler: ((_ url: URL, _ isMainFrame: Bool) -> Bool)?
+
+    /// Reports a main-frame navigation rejected by SkipWeb's Android content rules.
+    func contentRuleDidBlockNavigation(to url: URL) {
+        onContentRuleBlockedNavigation?(url)
+    }
 
     override func onPageFinished(view: PlatformWebView, url: String) {
         state.updatePageState(webView: view)
@@ -678,6 +690,7 @@ final class SkipWebChromeClient : android.webkit.WebChromeClient {
             onNavigationCommitted: self.webView.onNavigationCommitted,
             onNavigationFinished: self.webView.onNavigationFinished,
             onNavigationFailed: self.webView.onNavigationFailed,
+            onContentRuleBlockedNavigation: self.webView.onContentRuleBlockedNavigation,
             shouldOverrideUrlLoadingHandler: self.webView.shouldOverrideUrlLoading
         ))
         childEngine.webView.webChromeClient = self
@@ -789,6 +802,7 @@ extension WebView : ViewRepresentable {
             onNavigationCommitted: onNavigationCommitted,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed,
+            onContentRuleBlockedNavigation: onContentRuleBlockedNavigation,
             shouldOverrideUrlLoadingHandler: shouldOverrideUrlLoading
         ))
         if config.uiDelegate != nil || config.androidCreateWindowHandler != nil {
