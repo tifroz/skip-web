@@ -209,6 +209,27 @@ public struct AndroidBlockableRequest: Equatable, Sendable {
 }
 ```
 
+Android also evaluates HTTP(S) main-frame navigations through the configured
+`AndroidContentBlockingProvider`. These requests use `.document` as their resource type and carry
+the currently displayed page in `mainDocumentURL`, allowing a provider to distinguish the source
+page from the requested destination. Non-HTTP(S) schemes bypass this content-rule check.
+
+When the provider returns `.block`, SkipWeb cancels the navigation before the destination document
+loads. A `WebView` can observe that cancellation through the Android-only
+`onContentRuleBlockedNavigation` callback:
+
+```swift
+WebView(
+    configuration: configuration,
+    onContentRuleBlockedNavigation: { blockedURL in
+        showBlockedNavigationNotice(for: blockedURL)
+    }
+)
+```
+
+The callback reports the rejected destination URL. It does not run on Apple platforms, where the
+initializer remains source compatible because the closure defaults to `nil`.
+
 ### Cosmetic Blocking
 
 ```swift

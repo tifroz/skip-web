@@ -324,6 +324,12 @@ WebView(
 )
 ```
 
+On Android, content-blocking providers also receive HTTP(S) main-frame navigation requests. If a
+provider blocks one, `WebView.onContentRuleBlockedNavigation` reports the rejected destination so
+the host can explain why the visible page did not change. See
+[SkipWebContentBlockers.md](SkipWebContentBlockers.md#request-blocking) for the request fields and an
+integration example.
+
 Navigation APIs:
 
 - `load(url:)` is fire-and-forget and logs load failures.

@@ -12,6 +12,8 @@
   - Add `WebEngineConfiguration.iOSClearContentBlockerCache()` so apps can explicitly remove persisted iOS compiled rule lists
   - Add shared `whitelistedDomains` content-blocker config that bypasses blocking on matching iOS and Android page domains
   - Make Android redirect detection best-effort for request blocking on runtimes that do not support `WEB_RESOURCE_REQUEST_IS_REDIRECT`
+  - Add `WebEngine.isAttachedToWindow` and `waitForPendingVisualUpdates()` for coordinating WebView reveal transitions
+  - Evaluate Android HTTP(S) main-frame navigations through content rules and report blocked destinations with `WebView.onContentRuleBlockedNavigation`
 
 ## 0.5.1
 
